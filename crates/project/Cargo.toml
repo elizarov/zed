@@ -34,6 +34,7 @@ test-support = [
 ]
 
 [dependencies]
+vcs_provider.workspace = true
 aho-corasick.workspace = true
 anyhow.workspace = true
 askpass.workspace = true
@@ -109,6 +110,7 @@ zlog.workspace = true
 ztracing.workspace = true
 
 [dev-dependencies]
+vcs_provider = { workspace = true, features = ["test-support"] }
 client = { workspace = true, features = ["test-support"] }
 collections = { workspace = true, features = ["test-support"] }
 context_server = { workspace = true, features = ["test-support"] }

@@ -98,7 +98,10 @@ use worktree::{
 };
 use zeroize::Zeroize;
 
+mod external;
+
 pub struct GitStore {
+    external_starts: HashMap<WorktreeId, Task<()>>,
     state: GitStoreState,
     project: Option<WeakEntity<Project>>,
     buffer_store: Entity<BufferStore>,
@@ -314,21 +317,22 @@ enum DiffKind {
 }
 
 struct GitDiffOperations {
+    read_only: bool,
     project: WeakEntity<Project>,
     kind: DiffKind,
 }
 
 impl DiffOperations for GitDiffOperations {
     fn supports_staging(&self) -> bool {
-        matches!(self.kind, DiffKind::Unstaged | DiffKind::Uncommitted)
+        !self.read_only && matches!(self.kind, DiffKind::Unstaged | DiffKind::Uncommitted)
     }
 
     fn supports_unstaging(&self) -> bool {
-        matches!(self.kind, DiffKind::Staged | DiffKind::Uncommitted)
+        !self.read_only && matches!(self.kind, DiffKind::Staged | DiffKind::Uncommitted)
     }
 
     fn supports_restore(&self) -> bool {
-        matches!(self.kind, DiffKind::Unstaged | DiffKind::Uncommitted)
+        !self.read_only && matches!(self.kind, DiffKind::Unstaged | DiffKind::Uncommitted)
     }
 
     fn stage(
@@ -338,6 +342,9 @@ impl DiffOperations for GitDiffOperations {
         buffer_ranges: Vec<Range<Anchor>>,
         cx: &mut App,
     ) {
+        if self.read_only {
+            return;
+        }
         let result = self.project.update(cx, |project, cx| match self.kind {
             DiffKind::Unstaged => {
                 let buffer = buffer.context("unstaged diff has no worktree buffer")?;
@@ -363,6 +370,9 @@ impl DiffOperations for GitDiffOperations {
         buffer_ranges: Vec<Range<Anchor>>,
         cx: &mut App,
     ) {
+        if self.read_only {
+            return;
+        }
         let result = self.project.update(cx, |project, cx| match self.kind {
             DiffKind::Staged => project.unstage_staged_hunks(diff, buffer_ranges, cx),
             DiffKind::Uncommitted => {
@@ -678,6 +688,8 @@ pub enum UnshallowState {
 }
 
 pub struct Repository {
+    external_backend: Option<Arc<git::repository::ExternalRepository>>,
+    _provider_task: Task<()>,
     this: WeakEntity<Self>,
     snapshot: RepositorySnapshot,
     unshallow_state: UnshallowState,
@@ -1002,10 +1014,12 @@ impl GitStore {
                 this.set_diff_base(setting, cx);
             }
             this.activate_parked_repositories_where_parking_disabled(cx);
+            this.start_external_providers(cx);
         }));
 
         let diff_base_setting = ProjectSettings::get_global(cx).git.diff_base;
         GitStore {
+            external_starts: HashMap::default(),
             state,
             project: None,
             buffer_store,
@@ -1167,6 +1181,9 @@ impl GitStore {
                 let mut snapshots = HashMap::default();
                 let (updates_tx, mut updates_rx) = mpsc::unbounded();
                 for repo in self.repositories.values() {
+                    if repo.read(cx).is_read_only() {
+                        continue;
+                    }
                     updates_tx
                         .unbounded_send(DownstreamUpdate::UpdateRepository(
                             repo.read(cx).snapshot.clone(),
@@ -1415,6 +1432,12 @@ impl GitStore {
         worktree_ranges: Vec<Range<Anchor>>,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
+                .is_some_and(|(repository, _)| repository.read(cx).is_read_only()),
+            "external VCS provider is read-only"
+        );
         if worktree_ranges.is_empty() {
             return Ok(());
         }
@@ -1530,6 +1553,12 @@ impl GitStore {
         worktree_ranges: Vec<Range<Anchor>>,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
+                .is_some_and(|(repository, _)| repository.read(cx).is_read_only()),
+            "external VCS provider is read-only"
+        );
         if worktree_ranges.is_empty() {
             return Ok(());
         }
@@ -1598,6 +1627,12 @@ impl GitStore {
             .buffer_ids_by_index_text_buffer_id
             .get(&index_buffer_id)
             .context("failed to find git state for index text buffer")?;
+        anyhow::ensure!(
+            !self
+                .repository_and_path_for_buffer_id(buffer_id, cx)
+                .is_some_and(|(repository, _)| repository.read(cx).is_read_only()),
+            "external VCS provider is read-only"
+        );
         let diff_state = self
             .diffs
             .get(&buffer_id)
@@ -1870,6 +1905,9 @@ impl GitStore {
             this.loading_diffs.remove(&(buffer_id, kind));
 
             let git_store = cx.weak_entity();
+            let read_only = this
+                .repository_and_path_for_buffer_id(buffer_id, cx)
+                .is_some_and(|(repository, _)| repository.read(cx).is_read_only());
             let project = this.project.clone();
             let diff_state = this
                 .diffs
@@ -1896,7 +1934,11 @@ impl GitStore {
                                 cx,
                             );
                             if let Some(project) = project.clone() {
-                                diff.set_operations(Arc::new(GitDiffOperations { project, kind }));
+                                diff.set_operations(Arc::new(GitDiffOperations {
+                                    project,
+                                    kind,
+                                    read_only,
+                                }));
                             }
                             diff
                         })
@@ -1927,7 +1969,11 @@ impl GitStore {
                                 cx,
                             );
                             if let Some(project) = project.clone() {
-                                diff.set_operations(Arc::new(GitDiffOperations { project, kind }));
+                                diff.set_operations(Arc::new(GitDiffOperations {
+                                    project,
+                                    kind,
+                                    read_only,
+                                }));
                             }
                             diff
                         })
@@ -1943,7 +1989,11 @@ impl GitStore {
                                 cx,
                             );
                             if let Some(project) = project.clone() {
-                                diff.set_operations(Arc::new(GitDiffOperations { project, kind }));
+                                diff.set_operations(Arc::new(GitDiffOperations {
+                                    project,
+                                    kind,
+                                    read_only,
+                                }));
                             }
                             diff
                         })
@@ -1989,6 +2039,7 @@ impl GitStore {
                                     diff.set_operations(Arc::new(GitDiffOperations {
                                         project,
                                         kind: DiffKind::Unstaged,
+                                        read_only,
                                     }));
                                 }
                                 diff
@@ -2444,6 +2495,9 @@ impl GitStore {
         };
 
         match event {
+            WorktreeStoreEvent::WorktreeAdded(_) => {
+                self.start_external_providers(cx);
+            }
             WorktreeStoreEvent::WorktreeUpdatedEntries(worktree_id, updated_entries) => {
                 if let Some(worktree) = self
                     .worktree_store
@@ -2485,6 +2539,7 @@ impl GitStore {
                 self.local_worktree_git_repos_changed(worktree, changed_repos, cx);
             }
             WorktreeStoreEvent::WorktreeRemoved(_entity_id, worktree_id) => {
+                self.external_starts.remove(worktree_id);
                 self.parked_repositories
                     .retain(|parked| parked.worktree_id != *worktree_id);
                 let repos_without_worktree: Vec<RepositoryId> = self
@@ -2504,6 +2559,9 @@ impl GitStore {
                     .any(|repo_id| self.active_repo_id == Some(*repo_id));
 
                 for repo_id in repos_without_worktree {
+                    if let Some(repository) = self.repositories.get(&repo_id) {
+                        repository.update(cx, |repository, _| repository.stop_external_provider());
+                    }
                     self.display_diffs.remove(&repo_id);
                     self.repositories.remove(&repo_id);
                     self.worktree_ids.remove(&repo_id);
@@ -2603,6 +2661,19 @@ impl GitStore {
         fs: Arc<dyn Fs>,
         cx: &mut Context<Self>,
     ) {
+        if ProjectSettings::get(
+            Some(SettingsLocation {
+                worktree_id,
+                path: RelPath::empty(),
+            }),
+            cx,
+        )
+        .vcs_provider
+        .is_some()
+        {
+            self.start_external_providers(cx);
+            return;
+        }
         let mut removed_ids = Vec::new();
 
         let is_trusted = TrustedWorktrees::try_get_global(cx)
@@ -3009,6 +3080,42 @@ impl GitStore {
             TrustedWorktreesEvent::Restricted(_, restricted_paths) => (false, restricted_paths),
         };
 
+        if !is_trusted {
+            for path in event_paths {
+                if let PathTrust::Worktree(worktree_id) = path {
+                    self.external_starts.remove(worktree_id);
+                }
+            }
+            let removed = self
+                .repositories
+                .iter()
+                .filter_map(|(id, repository)| {
+                    (repository.read(cx).is_read_only()
+                        && self.worktree_ids.get(id).is_some_and(|ids| {
+                            ids.iter()
+                                .any(|id| event_paths.contains(&PathTrust::Worktree(*id)))
+                        }))
+                    .then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            for id in removed {
+                if let Some(repository) = self.repositories.get(&id) {
+                    repository.update(cx, |repository, _| repository.stop_external_provider());
+                }
+                self.repositories.remove(&id);
+                self.display_diffs.remove(&id);
+                if let Some(ids) = self.worktree_ids.remove(&id) {
+                    for worktree_id in ids {
+                        self.external_starts.remove(&worktree_id);
+                    }
+                }
+                if self.active_repo_id == Some(id) {
+                    self.active_repo_id = None;
+                    cx.emit(GitStoreEvent::ActiveRepositoryChanged(None));
+                }
+            }
+        }
+        self.start_external_providers(cx);
         for (repo_id, worktree_ids) in &self.worktree_ids {
             if worktree_ids
                 .iter()
@@ -3275,6 +3382,22 @@ impl GitStore {
         fallback_branch_name: String,
         cx: &App,
     ) -> Task<Result<()>> {
+        for worktree in self.worktree_store.read(cx).worktrees() {
+            let worktree = worktree.read(cx);
+            if path.starts_with(worktree.abs_path().as_ref())
+                && ProjectSettings::get(
+                    Some(SettingsLocation {
+                        worktree_id: worktree.id(),
+                        path: RelPath::empty(),
+                    }),
+                    cx,
+                )
+                .vcs_provider
+                .is_some()
+            {
+                return Task::ready(Err(anyhow!("this workspace uses an external VCS provider")));
+            }
+        }
         match &self.state {
             GitStoreState::Local { fs, .. } => {
                 let fs = fs.clone();
@@ -6436,6 +6559,9 @@ impl MergeDetails {
 
 impl Repository {
     pub fn is_trusted(&self) -> bool {
+        if let Some(backend) = &self.external_backend {
+            return backend.is_trusted();
+        }
         match self.repository_state.peek() {
             Some(Ok(RepositoryState::Local(state))) => state.backend.is_trusted(),
             _ => false,
@@ -6467,6 +6593,9 @@ impl Repository {
         is_trusted: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.is_read_only() {
+            return;
+        }
         let work_directory_abs_path = self.snapshot.work_directory_abs_path.clone();
         let dot_git_abs_path = self.snapshot.dot_git_abs_path.clone();
 
@@ -6513,6 +6642,9 @@ impl Repository {
         is_trusted: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.is_read_only() {
+            return;
+        }
         self.snapshot.work_directory_abs_path = work_directory_abs_path;
         self.snapshot.dot_git_abs_path = dot_git_abs_path;
         self.snapshot.repository_dir_abs_path = repository_dir_abs_path;
@@ -6542,6 +6674,8 @@ impl Repository {
         );
 
         let mut repo = Repository {
+            external_backend: None,
+            _provider_task: Task::ready(()),
             this: cx.weak_entity(),
             git_store,
             snapshot,
@@ -6592,6 +6726,8 @@ impl Repository {
         cx.subscribe_self(Self::handle_subscribe_self).detach();
 
         Self {
+            external_backend: None,
+            _provider_task: Task::ready(()),
             this: cx.weak_entity(),
             snapshot,
             unshallow_state: UnshallowState::default(),
@@ -8382,7 +8518,11 @@ impl Repository {
             None,
             move |git_repo, _cx| async move {
                 match git_repo {
-                    RepositoryState::Local(LocalRepositoryState { fs, .. }) => {
+                    RepositoryState::Local(LocalRepositoryState { fs, backend, .. }) => {
+                        anyhow::ensure!(
+                            !backend.is_read_only(),
+                            "external VCS provider is read-only"
+                        );
                         append_pattern_to_ignore_file(
                             fs,
                             work_dir.join(".gitignore"),
@@ -8427,7 +8567,11 @@ impl Repository {
             None,
             move |git_repo, _cx| async move {
                 match git_repo {
-                    RepositoryState::Local(LocalRepositoryState { fs, .. }) => {
+                    RepositoryState::Local(LocalRepositoryState { fs, backend, .. }) => {
+                        anyhow::ensure!(
+                            !backend.is_read_only(),
+                            "external VCS provider is read-only"
+                        );
                         append_pattern_to_ignore_file(
                             fs,
                             repository_dir.join(git::REPO_EXCLUDE),
@@ -10083,6 +10227,11 @@ impl Repository {
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut Context<Self>,
     ) {
+        let updates_tx = if self.is_read_only() {
+            None
+        } else {
+            updates_tx
+        };
         let this = cx.weak_entity();
         let _ = self.send_keyed_job(
             "schedule_scan",
@@ -10409,6 +10558,11 @@ impl Repository {
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut Context<Self>,
     ) {
+        let updates_tx = if self.is_read_only() {
+            None
+        } else {
+            updates_tx
+        };
         if !paths.is_empty() {
             self.paths_needing_status_update.push(paths);
         }

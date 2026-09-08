@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/vcs_provider",
     "crates/acp_thread",
     "crates/acp_tools",
     "crates/action_log",
@@ -270,6 +271,7 @@ publish = false
 edition = "2024"
 
 [workspace.dependencies]
+vcs_provider = { path = "crates/vcs_provider" }
 
 #
 # Workspace member crates

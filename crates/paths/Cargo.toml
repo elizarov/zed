@@ -19,3 +19,6 @@ const_format.workspace = true
 dirs.workspace = true
 ignore.workspace = true
 util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

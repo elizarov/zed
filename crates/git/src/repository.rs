@@ -43,6 +43,9 @@ use uuid::Uuid;
 
 pub use askpass::{AskPassDelegate, AskPassResult, AskPassSession};
 
+mod external;
+pub use external::ExternalRepository;
+
 pub const REMOTE_CANCELLED_BY_USER: &str = "Operation cancelled by user";
 
 /// Format string used in graph log to get initial data for the git graph
@@ -787,6 +790,10 @@ pub fn delete_branch_flag(is_remote_tracking_ref: bool, force: bool) -> &'static
 }
 
 pub trait GitRepository: Send + Sync {
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     /// Returns the contents of an entry in the repository's index, or None if there is no entry for the given path.
     ///
     /// Also returns `None` for symlinks.

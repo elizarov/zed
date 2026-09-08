@@ -2582,6 +2582,9 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let workspace = self.workspace.clone();
         let Some(active_repo) = self.active_repository.clone() else {
             return;
@@ -2875,6 +2878,9 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let entries = self
             .directory_context_descendants()
             .map(Self::staged_tracked_entries)
@@ -2919,6 +2925,9 @@ impl GitPanel {
     }
 
     fn clean_all(&mut self, _: &TrashUntrackedFiles, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let workspace = self.workspace.clone();
         let Some(active_repo) = self.active_repository.clone() else {
             return;
@@ -5304,6 +5313,9 @@ impl GitPanel {
         self.stash_entries = repo.cached_stash();
 
         for status_entry in repo.cached_status() {
+            if status_entry.status.is_ignored() {
+                continue;
+            }
             self.changes_count += 1;
             let is_conflict = repo.had_conflict_on_last_merge_head_change(&status_entry.repo_path);
             let is_new = status_entry.status.is_created();
@@ -6488,6 +6500,9 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let active_repository = self.active_repository.clone()?;
+        if active_repository.read(cx).is_read_only() {
+            return None;
+        }
         let settings = ThemeSettings::get_global(cx);
         let panel_editor_style =
             git_commit_editor_style(settings.git_commit_buffer_font_size(cx), cx);
@@ -8687,6 +8702,10 @@ impl GitPanel {
 
     fn has_write_access(&self, cx: &App) -> bool {
         !self.project.read(cx).is_read_only(cx)
+            && self
+                .active_repository
+                .as_ref()
+                .is_none_or(|repository| !repository.read(cx).is_read_only())
     }
 
     pub fn load_commit_template(
@@ -9024,6 +9043,18 @@ impl Render for GitPanel {
                     .map(|this| match self.active_tab {
                         GitPanelTab::Changes => this
                             .children(self.render_changes_header(window, cx))
+                            .when(
+                                self.active_repository
+                                    .as_ref()
+                                    .is_some_and(|repository| repository.read(cx).is_read_only()),
+                                |this| {
+                                    this.child(
+                                        Label::new("Read-only VCS provider")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                },
+                            )
                             .when(!self.commit_editor_expanded, |this| {
                                 this.map(|this| {
                                     if let Some(repo) = self.active_repository.clone()

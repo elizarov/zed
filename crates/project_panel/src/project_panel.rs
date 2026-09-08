@@ -1128,7 +1128,7 @@ impl ProjectPanel {
                 let git_store = project.git_store().read(cx);
                 let has_git_repo = git_store
                     .repository_and_path_for_project_path(&project_path, cx)
-                    .is_some();
+                    .is_some_and(|(repository, _)| !repository.read(cx).is_read_only());
                 let has_history = has_git_repo
                     && !git_store
                         .project_path_git_status(&project_path, cx)
@@ -2437,6 +2437,9 @@ impl ProjectPanel {
                 .read(cx)
                 .repository_and_path_for_project_path(&project_path, cx)?;
 
+            if repository.read(cx).is_read_only() {
+                return None;
+            }
             let snapshot = repository.read(cx).snapshot();
             let status = snapshot.status_for_path(&repo_path)?;
             if !status.status.is_modified() && !status.status.is_deleted() {

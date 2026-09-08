@@ -39,6 +39,7 @@ use crate::{
 
 #[derive(Debug, Clone, RegisterSetting)]
 pub struct ProjectSettings {
+    pub vcs_provider: Option<settings::VcsProviderSettings>,
     /// Configuration for language servers.
     ///
     /// The following settings can be overridden for specific language servers:
@@ -728,6 +729,7 @@ impl Settings for ProjectSettings {
                 .map(|(key, value)| (key, value.into()))
                 .collect(),
             context_server_timeout: project.context_server_timeout.unwrap_or(60),
+            vcs_provider: project.vcs_provider.clone(),
             lsp: project
                 .lsp
                 .clone()
