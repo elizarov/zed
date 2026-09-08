@@ -1,0 +1,118 @@
+use std::{collections::BTreeMap, path::Path, time::Duration};
+use vcs_provider::{Client, read_message, validate_path};
+
+async fn start(mode: &str, timeout: Duration) -> anyhow::Result<Client> {
+    Client::start(
+        "python3",
+        &[
+            format!("{}/tests/mock_provider.py", env!("CARGO_MANIFEST_DIR")),
+            mode.into(),
+        ],
+        &BTreeMap::new(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        timeout,
+    )
+    .await
+}
+
+#[test]
+fn mock_discovery_status_notifications_and_lazy_content() {
+    smol::block_on(async {
+        let client = start("normal", Duration::from_secs(3)).await.unwrap();
+        assert!(client.supports_staging);
+        assert_eq!(client.snapshot().changes.len(), 3);
+        let contents = client
+            .contents(
+                &[
+                    "hello.txt".into(),
+                    "hello.txt".into(),
+                    "new.txt".into(),
+                    "clean.txt".into(),
+                ],
+                &[false, true, false, false],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            contents,
+            vec![
+                Some(b"base\n\x00\xff".to_vec()),
+                Some(b"index\n\x00\xff".to_vec()),
+                None,
+                Some(b"base\n\x00\xff".to_vec())
+            ]
+        );
+        client.refresh().await.unwrap();
+        assert_eq!(client.snapshot().snapshot, "2");
+    });
+}
+
+#[test]
+fn rejects_invalid_providers_and_bounds_request_time() {
+    smol::block_on(async {
+        for mode in ["version", "eof", "bad-id", "bad-path", "timeout"] {
+            assert!(
+                start(mode, Duration::from_millis(200)).await.is_err(),
+                "{mode}"
+            );
+        }
+    });
+}
+
+#[test]
+fn errors_preserve_the_last_valid_snapshot() {
+    smol::block_on(async {
+        let client = start("status-error", Duration::from_secs(3)).await.unwrap();
+        let snapshot = client.snapshot();
+        assert!(client.refresh().await.is_err());
+        assert_eq!(client.snapshot(), snapshot);
+        assert!(
+            client
+                .contents(&["hello.txt".into()], &[false])
+                .await
+                .is_ok()
+        );
+    });
+}
+
+#[test]
+fn framing_and_path_validation() {
+    smol::block_on(async {
+        for message in [
+            b"Content-Length: 999999999\r\n\r\n".as_slice(),
+            b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}",
+            b"Content-Length: 10\r\n\r\n{}",
+            b"\r\n",
+            &[b'x'; 9000],
+        ] {
+            assert!(
+                read_message(&mut message.to_vec().as_slice())
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            read_message(&mut b"Content-Length: 2\r\n\r\n{}".as_slice())
+                .await
+                .unwrap(),
+            serde_json::json!({})
+        );
+    });
+    for path in ["../a", "/a", "a/../b", "a//b", "a\\b", "C:/a", "a\0b", ""] {
+        assert!(validate_path(path).is_err());
+    }
+    assert!(validate_path("dir/unicode 🦀.txt").is_ok());
+}
+
+#[test]
+fn expired_snapshot_is_refreshed_and_retried_once() {
+    smol::block_on(async {
+        let client = start("expired", Duration::from_secs(3)).await.unwrap();
+        let contents = client
+            .contents(&["hello.txt".into()], &[false])
+            .await
+            .unwrap();
+        assert_eq!(contents, vec![Some(b"base\n\x00\xff".to_vec())]);
+        assert_eq!(client.snapshot().snapshot, "2");
+    });
+}

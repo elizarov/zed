@@ -7154,6 +7154,7 @@ dependencies = [
  "urlencoding",
  "util",
  "uuid",
+ "vcs_provider",
  "ztracing",
 ]
 
@@ -12828,6 +12829,7 @@ dependencies = [
  "const_format",
  "dirs",
  "ignore",
+ "tempfile",
  "util",
 ]
 
@@ -14145,6 +14147,7 @@ dependencies = [
  "unindent",
  "url",
  "util",
+ "vcs_provider",
  "watch",
  "wax",
  "which",
@@ -19932,6 +19935,18 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vcs_provider"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "smol",
+]
 
 [[package]]
 name = "version-compare"

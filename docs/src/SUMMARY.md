@@ -27,6 +27,7 @@
   - [Debugger](./debugger.md)
   - [REPL](./repl.md)
 - [Git](./git.md)
+  - [External VCS Providers (Experimental)](./development/vcs-provider-protocol.md)
 - [Modelines](./modelines.md)
 
 # Collaboration

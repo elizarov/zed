@@ -42,6 +42,9 @@ impl RootUserSettings for ProjectSettingsContent {
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Clone, Default, Serialize, JsonSchema, MergeFrom)]
 pub struct ProjectSettingsContent {
+    /// Experimental read-only VCS provider. Reopen the project after changing it.
+    pub vcs_provider: Option<VcsProviderSettings>,
+
     #[serde(flatten)]
     pub all_languages: AllLanguageSettingsContent,
 
@@ -90,10 +93,21 @@ pub struct ProjectSettingsContent {
 crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
-        terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai, vcs_provider,
     },
     defaults: { lsp, dap, context_servers },
 });
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct VcsProviderSettings {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    pub poll_interval_ms: Option<u64>,
+    pub request_timeout_ms: Option<u64>,
+}
 
 /// When to scan content of linked directories.
 #[derive(

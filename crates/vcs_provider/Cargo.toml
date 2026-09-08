@@ -1,0 +1,20 @@
+[package]
+name = "vcs_provider"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/vcs_provider.rs"
+
+[features]
+test-support = []
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+parking_lot.workspace = true
