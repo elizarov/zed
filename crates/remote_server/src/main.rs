@@ -23,6 +23,9 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Ok(directory) = std::env::var("ZED_REMOTE_USER_DATA_DIR") {
+        paths::set_custom_data_dir(&shellexpand::tilde(&directory));
+    }
 
     if let Some(socket_path) = &cli.askpass {
         askpass::main(socket_path);

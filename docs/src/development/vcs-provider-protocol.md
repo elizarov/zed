@@ -35,14 +35,54 @@ and is launched directly, without shell interpretation. Use absolute executable
 paths; shell expansions, including `~`, do not apply. Polling defaults to 2000 ms
 (minimum 250); request timeouts default to 30000 ms (clamped to 100–300000).
 
-The setting selects one external provider per opened local worktree, including
+The setting selects one external provider per opened worktree on the host, including
 when the worktree is a subdirectory of a larger repository. It supersedes native
 Git discovery in that worktree. Restart the project after configuration changes
 or a failed process launch. Startup errors are recorded in Zed's log.
 
 An untrusted worktree cannot launch a provider. Restricting or closing a worktree
-stops its provider. This prototype does not transport external repositories to
-collaboration guests or SSH clients; configure it only in local projects.
+stops its provider and removes the repository from connected SSH clients.
+Collaboration guests are not supported.
+
+## SSH Workspaces {#ssh-workspaces}
+
+Run matching builds of this fork on the client and SSH host. The remote server
+launches the provider locally, using remote paths, credentials, and environment.
+The provider's protocol is unchanged: framed JSON-RPC stays on the host. Zed's
+existing remote transport carries repository snapshots, incremental status
+updates, and requested diff baselines to the editor. Repository updates include
+`is_read_only`; both the client controls and the host backend reject VCS writes.
+Ordinary file editing remains available.
+
+Configure `vcs_provider` in the **server settings**, or in a trusted remote
+project's `.zed/settings.json`. Client user settings do not forward this setting,
+including platform, release-channel, and profile overrides. Trust is granted
+through the existing worktree trust RPC. Revocation stops the process; trusting
+again starts a new one. Disconnect/reconnect uses Zed's existing remote session
+lifecycle and repository snapshot synchronization.
+
+For a separate development server, clone your fork on the host and build there:
+
+```sh
+cargo build --locked -p remote_server --features debug-embed
+```
+
+`debug-embed` includes the assets needed to run outside the checkout. Launch the
+local development editor with these optional environment variables:
+
+```sh
+ZED_REMOTE_SERVER_PATH=/work/zed/build/debug/remote_server \
+ZED_REMOTE_USER_DATA_DIR=/work/zed-dev/profile \
+./build/debug/zed ssh://user@host/work/project
+```
+
+`ZED_REMOTE_SERVER_PATH` selects a prebuilt executable **on the SSH host**, checks
+that it runs, and skips automatic download/build/upload. It applies only to the
+`dev` release channel. `ZED_REMOTE_USER_DATA_DIR` isolates the POSIX SSH server's
+configuration and data; put server settings in `<directory>/config/settings.json`.
+Paths are interpreted on the remote host. Without these overrides, the existing
+SSH server setup applies; automatic development builds live in
+`build/remote_server/`. Rebuild and restart both sides after protocol changes.
 
 ## Transport and Lifecycle {#transport-and-lifecycle}
 
@@ -304,7 +344,7 @@ file editing remains available. Providers must implement only read operations;
 there is no generic command execution or write-content endpoint.
 
 History, blame, branch switching, conflict resolution, Git diff statistics,
-network operations, arbitrary resource groups, and remote/collaboration transport
+network operations, arbitrary resource groups, and collaboration transport
 are not implemented. Some existing UI labels still say "Git". This adapter is a
 path toward a generic repository model rather than a complete replacement of
 Zed's Git-specific UI.
@@ -317,13 +357,17 @@ From the repository root:
 cargo test -p vcs_provider
 cargo test -p project external_provider_
 cargo check -p git_ui
+cargo test -p remote_server --lib test_remote_external_provider
 ```
 
 The protocol suite uses a real mock process and covers framing, initialization,
 status, notifications, lazy binary content, expired snapshots, provider errors,
 and timeouts. The
 project tests use an in-memory mock for native tree status, live baseline refresh,
-and blocked writes, plus a mock process for settings, trust revocation, and restart behavior.
+and blocked writes, plus a mock process for settings, trust revocation, and restart
+behavior. The remote test runs a mock provider behind a headless server and the
+real Zed RPC layer, checking settings isolation, status and baseline refresh,
+read-only controls, rejected writes, resharing, and trust revocation/restart.
 
 To inspect a provider through the same Rust client used by Zed:
 
@@ -334,3 +378,14 @@ cargo run -p vcs_provider --example inspect -- \
 ```
 
 The inspector reports timings and baseline sizes without printing file contents.
+
+For a live SSH smoke test, use a dedicated proxy identifier. This probe reads a
+tracked file's baselines, verifies read-only status, revokes trust, and shuts down
+only that test server session. It never saves a file or requests VCS mutations.
+Disable language servers in the test profile if they can run builds in the
+worktree.
+
+```sh
+cargo run -p remote --example vcs_probe -- /work/project src/example.txt \
+  ssh user@host 'env ZED_REMOTE_USER_DATA_DIR=/work/zed-dev/profile /work/zed/build/debug/remote_server proxy --identifier vcs-smoke-test'
+```

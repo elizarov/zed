@@ -985,8 +985,28 @@ impl SettingsObserver {
                 user_settings_watcher = Some(cx.observe_global::<SettingsStore>(move |_, cx| {
                     if let Some(new_settings) = cx.global::<SettingsStore>().raw_user_settings() {
                         if Some(new_settings) != user_settings.as_ref() {
+                            let mut remote_settings = new_settings.clone();
+                            // Provider commands and paths belong to the machine running the worktree.
+                            remote_settings.content.project.vcs_provider = None;
+                            for settings in [
+                                &mut remote_settings.release_channel_overrides.dev,
+                                &mut remote_settings.release_channel_overrides.nightly,
+                                &mut remote_settings.release_channel_overrides.preview,
+                                &mut remote_settings.release_channel_overrides.stable,
+                                &mut remote_settings.platform_overrides.macos,
+                                &mut remote_settings.platform_overrides.linux,
+                                &mut remote_settings.platform_overrides.windows,
+                            ]
+                            .into_iter()
+                            .flatten()
+                            {
+                                settings.project.vcs_provider = None;
+                            }
+                            for profile in remote_settings.profiles.values_mut() {
+                                profile.settings.project.vcs_provider = None;
+                            }
                             if let Some(new_settings_string) =
-                                serde_json::to_string(new_settings).ok()
+                                serde_json::to_string(&remote_settings).log_err()
                             {
                                 user_settings = Some(new_settings.clone());
                                 upstream_client

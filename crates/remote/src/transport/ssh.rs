@@ -45,7 +45,7 @@ pub(crate) struct SshRemoteConnection {
     /// Whether `kill()` has been called. Separate from `master_process` because
     /// reused ControlMaster sessions start with `master_process` as `None`.
     killed: AtomicBool,
-    remote_binary_path: Option<Arc<RelPath>>,
+    remote_binary_path: Option<String>,
     ssh_platform: RemotePlatform,
     ssh_os_version: Option<String>,
     ssh_path_style: PathStyle,
@@ -472,7 +472,12 @@ impl RemoteConnection for SshRemoteConnection {
         delegate: Arc<dyn RemoteClientDelegate>,
         cx: &mut AsyncApp,
     ) -> Task<Result<i32>> {
-        const VARS: [&str; 3] = ["RUST_LOG", "RUST_BACKTRACE", "ZED_GENERATE_MINIDUMPS"];
+        const VARS: [&str; 4] = [
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+            "ZED_GENERATE_MINIDUMPS",
+            "ZED_REMOTE_USER_DATA_DIR",
+        ];
         delegate.set_status(Some("Starting proxy"), cx);
 
         let Some(remote_binary_path) = self.remote_binary_path.clone() else {
@@ -490,12 +495,8 @@ impl RemoteConnection for SshRemoteConnection {
             if reconnect {
                 proxy_args.push("--reconnect".to_owned());
             }
-            self.socket.ssh_command(
-                self.ssh_shell_kind,
-                &remote_binary_path.display(self.path_style()),
-                &proxy_args,
-                false,
-            )
+            self.socket
+                .ssh_command(self.ssh_shell_kind, &remote_binary_path, &proxy_args, false)
         } else {
             let mut proxy_args = vec![];
             for env_var in VARS {
@@ -503,7 +504,7 @@ impl RemoteConnection for SshRemoteConnection {
                     proxy_args.push(format!("{env_var}={value}"));
                 }
             }
-            proxy_args.push(remote_binary_path.display(self.path_style()).into_owned());
+            proxy_args.push(remote_binary_path);
             proxy_args.push("proxy".to_owned());
             proxy_args.push("--identifier".to_owned());
             proxy_args.push(unique_identifier);
@@ -836,7 +837,16 @@ impl SshRemoteConnection {
         release_channel: ReleaseChannel,
         version: Version,
         cx: &mut AsyncApp,
-    ) -> Result<Arc<RelPath>> {
+    ) -> Result<String> {
+        if release_channel == ReleaseChannel::Dev
+            && let Ok(path) = std::env::var("ZED_REMOTE_SERVER_PATH")
+        {
+            self.socket
+                .run_command(self.ssh_shell_kind, &path, &["version"], true)
+                .await
+                .context("checking ZED_REMOTE_SERVER_PATH on the SSH host")?;
+            return Ok(path);
+        }
         let version_str = match release_channel {
             ReleaseChannel::Dev => "build".to_string(),
             _ => version.to_string(),
@@ -886,11 +896,11 @@ impl SshRemoteConnection {
                 .await?;
             self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)
                 .await?;
-            return Ok(dst_path.into());
+            return Ok(dst_path.display(self.path_style()).into_owned());
         }
 
         if binary_exists_on_server {
-            return Ok(dst_path.into());
+            return Ok(dst_path.display(self.path_style()).into_owned());
         }
 
         let wanted_version = cx.update(|cx| match release_channel {
@@ -935,7 +945,7 @@ impl SshRemoteConnection {
                     self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
                         .await
                         .context("extracting server binary")?;
-                    return Ok(dst_path.into());
+                    return Ok(dst_path.display(self.path_style()).into_owned());
                 }
                 Err(e) => {
                     log::error!(
@@ -960,7 +970,7 @@ impl SshRemoteConnection {
         self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
             .await
             .context("extracting server binary")?;
-        Ok(dst_path.into())
+        Ok(dst_path.display(self.path_style()).into_owned())
     }
 
     async fn download_binary_on_server(
