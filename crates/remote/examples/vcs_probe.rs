@@ -13,6 +13,7 @@ struct Probe {
     output: ChildStdout,
     next_id: u32,
     ack_id: Option<u32>,
+    next_worktree_id: u64,
     repositories: BTreeMap<u64, proto::UpdateRepository>,
 }
 
@@ -36,9 +37,26 @@ impl Probe {
         self.ack_id = Some(message.id);
         if message.responding_to.is_none() {
             match &message.payload {
-                Some(Payload::Ping(_) | Payload::UpdateWorktree(_) | Payload::UpdateProject(_)) => {
+                Some(
+                    Payload::RemoteStarted(_)
+                    | Payload::Ping(_)
+                    | Payload::UpdateWorktree(_)
+                    | Payload::UpdateProject(_),
+                ) => {
                     self.send(proto::Ack {}.into_envelope(0, Some(message.id), None))
                         .await?;
+                }
+                Some(Payload::AllocateWorktreeId(_)) => {
+                    let worktree_id = self.next_worktree_id;
+                    self.next_worktree_id += 1;
+                    self.send(
+                        proto::AllocateWorktreeIdResponse { worktree_id }.into_envelope(
+                            0,
+                            Some(message.id),
+                            None,
+                        ),
+                    )
+                    .await?;
                 }
                 Some(Payload::UpdateRepository(update)) => {
                     let repository = self.repositories.entry(update.id).or_default();
@@ -97,8 +115,11 @@ fn main() -> Result<()> {
             output: child.stdout.take().context("missing proxy stdout")?,
             next_id: 1,
             ack_id: None,
+            next_worktree_id: 1,
             repositories: BTreeMap::new(),
         };
+        probe.request(proto::RemoteStarted {}).await?;
+        println!("Remote server handshake complete");
         let project_id = proto::REMOTE_SERVER_PROJECT_ID;
         let worktree = probe
             .request(proto::AddWorktree {
@@ -107,6 +128,7 @@ fn main() -> Result<()> {
                 visible: true,
             })
             .await?;
+        println!("Remote worktree opened: {}", worktree.worktree_id);
         probe
             .request(proto::TrustWorktrees {
                 project_id,
