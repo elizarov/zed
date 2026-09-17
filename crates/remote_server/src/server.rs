@@ -722,11 +722,14 @@ pub fn execute_run(
 
         handle_crash_files_requests(&project, &session);
 
-        cx.background_spawn(async move {
-            cleanup_old_binaries_wsl();
-            cleanup_old_binaries()
-        })
-        .detach();
+        // A separately configured development server must not clean up stock installations.
+        if std::env::var_os("ZED_REMOTE_USER_DATA_DIR").is_none() {
+            cx.background_spawn(async move {
+                cleanup_old_binaries_wsl();
+                cleanup_old_binaries()
+            })
+            .detach();
+        }
 
         mem::forget(project);
     };

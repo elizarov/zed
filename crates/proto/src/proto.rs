@@ -1137,6 +1137,7 @@ mod tests {
     #[test]
     fn test_split_repository_update_keeps_branch_list_on_final_chunk() {
         let update = UpdateRepository {
+            is_read_only: true,
             updated_statuses: vec![
                 StatusEntry::default(),
                 StatusEntry::default(),
@@ -1153,6 +1154,7 @@ mod tests {
         let chunks = split_repository_update(update).collect::<Vec<_>>();
 
         assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.is_read_only));
         assert!(chunks[0].branch_list.is_empty());
         assert!(chunks[1].branch_list.is_empty());
         assert_eq!(chunks[2].branch_list.len(), 1);

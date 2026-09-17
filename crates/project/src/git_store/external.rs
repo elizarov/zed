@@ -96,11 +96,16 @@ impl GitStore {
         cx: &mut Context<Self>,
     ) {
         let GitStoreState::Local {
-            next_repository_id, ..
+            next_repository_id,
+            downstream,
+            ..
         } = &self.state
         else {
             return;
         };
+        let updates_tx = downstream
+            .as_ref()
+            .map(|downstream| downstream.updates_tx.clone());
         let id = RepositoryId(next_repository_id.fetch_add(1, atomic::Ordering::Release));
         let root: Arc<Path> = backend.path().into();
         // Provider selection is explicit for this scope. Replace an already discovered
@@ -113,6 +118,11 @@ impl GitStore {
             })
             .collect::<Vec<_>>();
         for replaced in replaced {
+            if let Some(updates_tx) = &updates_tx {
+                updates_tx
+                    .unbounded_send(DownstreamUpdate::RemoveRepository(replaced))
+                    .log_err();
+            }
             self.repositories.remove(&replaced);
             self.worktree_ids.remove(&replaced);
             self.display_diffs.remove(&replaced);
@@ -121,13 +131,34 @@ impl GitStore {
             }
         }
         let git_store = cx.weak_entity();
-        let repository =
-            cx.new(|cx| Repository::external(id, root, backend, fs, interval, git_store, cx));
+        let repository = cx.new(|cx| {
+            Repository::external(id, root, backend, fs, interval, git_store, updates_tx, cx)
+        });
         self._subscriptions
             .push(cx.subscribe(&repository, Self::on_repository_event));
         self._subscriptions
             .push(cx.subscribe(&repository, Self::on_jobs_updated));
         self.repositories.insert(id, repository);
+        self.update_diff_operations_for_repository(id, cx);
+        self.worktree_ids
+            .insert(id, HashSet::from_iter([worktree_id]));
+        cx.emit(GitStoreEvent::RepositoryAdded);
+        self.refresh_diff_base_for_repo(id, cx);
+        if self.active_repo_id.is_none() {
+            self.active_repo_id = Some(id);
+            cx.emit(GitStoreEvent::ActiveRepositoryChanged(Some(id)));
+        }
+    }
+
+    pub(super) fn update_diff_operations_for_repository(
+        &self,
+        id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.repositories.get(&id) else {
+            return;
+        };
+        let read_only = repository.read(cx).is_read_only();
         if let Some(project) = self.project.clone() {
             for (buffer_id, state) in &self.diffs {
                 if !self
@@ -147,20 +178,12 @@ impl GitStore {
                             diff.set_operations(Arc::new(GitDiffOperations {
                                 project: project.clone(),
                                 kind,
-                                read_only: true,
+                                read_only,
                             }))
                         });
                     }
                 }
             }
-        }
-        self.worktree_ids
-            .insert(id, HashSet::from_iter([worktree_id]));
-        cx.emit(GitStoreEvent::RepositoryAdded);
-        self.refresh_diff_base_for_repo(id, cx);
-        if self.active_repo_id.is_none() {
-            self.active_repo_id = Some(id);
-            cx.emit(GitStoreEvent::ActiveRepositoryChanged(Some(id)));
         }
     }
 }
@@ -173,11 +196,12 @@ impl Repository {
         fs: Arc<dyn Fs>,
         interval: Duration,
         git_store: WeakEntity<GitStore>,
+        updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut Context<Self>,
     ) -> Self {
         // Metadata paths are inert placeholders for the existing snapshot type. No
         // filesystem repository is opened; every VCS operation goes through the backend.
-        let snapshot = RepositorySnapshot::empty(
+        let mut snapshot = RepositorySnapshot::empty(
             id,
             root.clone(),
             Some(root.clone()),
@@ -185,6 +209,7 @@ impl Repository {
             Some(root),
             PathStyle::local(),
         );
+        snapshot.is_read_only = true;
         let state = LocalRepositoryState {
             backend: backend.clone(),
             fs,
@@ -214,7 +239,7 @@ impl Repository {
             commit_data: Default::default(),
             commit_data_handler: CommitDataHandlerState::Closed,
         };
-        repository.schedule_scan(None, cx);
+        repository.schedule_scan(updates_tx, cx);
         repository._provider_task = cx.spawn(async move |this, cx| {
             let mut previous_snapshot = backend.client.snapshot().snapshot;
             let mut previous_error = None;
@@ -232,7 +257,17 @@ impl Repository {
                     }
                     if this
                         .update(cx, |this, cx| {
-                            this.schedule_scan(None, cx);
+                            let updates_tx =
+                                this.git_store.upgrade().and_then(|store| {
+                                    match &store.read(cx).state {
+                                        GitStoreState::Local {
+                                            downstream: Some(downstream),
+                                            ..
+                                        } => Some(downstream.updates_tx.clone()),
+                                        _ => None,
+                                    }
+                                });
+                            this.schedule_scan(updates_tx, cx);
                             if result.is_ok() {
                                 this.reload_buffer_diff_bases(cx);
                             }
@@ -251,7 +286,7 @@ impl Repository {
     }
 
     pub fn is_read_only(&self) -> bool {
-        self.external_backend.is_some()
+        self.snapshot.is_read_only
     }
 
     pub(super) fn stop_external_provider(&mut self) {

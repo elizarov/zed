@@ -338,7 +338,7 @@ async fn build_remote_server_from_source(
                     "--features",
                     "debug-embed",
                     "--target-dir",
-                    "target/remote_server",
+                    "build/remote_server",
                     "--target",
                     &triple,
                 ])
@@ -387,7 +387,7 @@ async fn build_remote_server_from_source(
                     "--features",
                     "debug-embed",
                     "--target-dir",
-                    "target/remote_server",
+                    "build/remote_server",
                     "--target",
                     &triple,
                 ])
@@ -397,7 +397,7 @@ async fn build_remote_server_from_source(
     };
     let bin_path = util::dev_repo_root()
         .context("locating the zed checkout that built remote_server from source")?
-        .join("target")
+        .join("build")
         .join("remote_server")
         .join(&triple)
         .join("debug")

@@ -606,6 +606,7 @@ pub enum CommitDataState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositorySnapshot {
     pub id: RepositoryId,
+    pub is_read_only: bool,
     pub statuses_by_path: SumTree<StatusEntry>,
     pub work_directory_abs_path: Arc<Path>,
     pub dot_git_abs_path: Arc<Path>,
@@ -1167,6 +1168,9 @@ impl GitStore {
                 ..
             } => {
                 for repo in self.repositories.values() {
+                    if repo.read(cx).is_read_only() && client.is_via_collab() {
+                        continue;
+                    }
                     let update = repo.read(cx).snapshot.initial_update(project_id);
                     for update in split_repository_update(update) {
                         client.send(update).log_err();
@@ -1179,9 +1183,10 @@ impl GitStore {
                 ..
             } => {
                 let mut snapshots = HashMap::default();
+                let mut removed_repositories = HashSet::<RepositoryId>::default();
                 let (updates_tx, mut updates_rx) = mpsc::unbounded();
                 for repo in self.repositories.values() {
-                    if repo.read(cx).is_read_only() {
+                    if repo.read(cx).is_read_only() && client.is_via_collab() {
                         continue;
                     }
                     updates_tx
@@ -1199,6 +1204,12 @@ impl GitStore {
                             while let Some(update) = updates_rx.next().await {
                                 match update {
                                     DownstreamUpdate::UpdateRepository(snapshot) => {
+                                        // A scan already in flight when trust was revoked may finish late.
+                                        if removed_repositories.contains(&snapshot.id)
+                                            || (snapshot.is_read_only && client.is_via_collab())
+                                        {
+                                            continue;
+                                        }
                                         if let Some(old_snapshot) = snapshots.get_mut(&snapshot.id)
                                         {
                                             let update =
@@ -1216,6 +1227,8 @@ impl GitStore {
                                         }
                                     }
                                     DownstreamUpdate::RemoveRepository(id) => {
+                                        removed_repositories.insert(id);
+                                        snapshots.remove(&id);
                                         client.send(proto::RemoveRepository {
                                             project_id,
                                             id: id.to_proto(),
@@ -3104,6 +3117,17 @@ impl GitStore {
                 }
                 self.repositories.remove(&id);
                 self.display_diffs.remove(&id);
+                if let GitStoreState::Local {
+                    downstream: Some(downstream),
+                    ..
+                } = &self.state
+                {
+                    downstream
+                        .updates_tx
+                        .unbounded_send(DownstreamUpdate::RemoveRepository(id))
+                        .log_err();
+                }
+                cx.emit(GitStoreEvent::RepositoryRemoved(id));
                 if let Some(ids) = self.worktree_ids.remove(&id) {
                     for worktree_id in ids {
                         self.external_starts.remove(&worktree_id);
@@ -3535,11 +3559,15 @@ impl GitStore {
             });
             this._subscriptions.extend(repo_subscription);
 
+            let read_only_changed = repo.read(cx).is_read_only() != update.is_read_only;
             repo.update(cx, {
                 let update = update.clone();
                 |repo, cx| repo.apply_remote_update(update, cx)
             })?;
 
+            if is_new || read_only_changed {
+                this.update_diff_operations_for_repository(id, cx);
+            }
             if is_new {
                 this.refresh_diff_base_for_repo(id, cx);
             }
@@ -3549,7 +3577,9 @@ impl GitStore {
                 id
             });
 
-            if let Some((client, project_id)) = this.downstream_client() {
+            if let Some((client, project_id)) = this.downstream_client()
+                && !(update.is_read_only && client.is_via_collab())
+            {
                 update.project_id = project_id.to_proto();
                 client.send(update).log_err();
             }
@@ -6222,6 +6252,7 @@ impl RepositorySnapshot {
 
         Self {
             id,
+            is_read_only: false,
             statuses_by_path: Default::default(),
             repository_dir_abs_path,
             dot_git_abs_path,
@@ -6243,6 +6274,7 @@ impl RepositorySnapshot {
 
     fn initial_update(&self, project_id: u64) -> proto::UpdateRepository {
         proto::UpdateRepository {
+            is_read_only: self.is_read_only,
             branch_summary: self.branch.as_ref().map(branch_to_proto),
             branch_list: self.branch_list.iter().map(branch_to_proto).collect(),
             branch_list_error: self
@@ -6334,6 +6366,7 @@ impl RepositorySnapshot {
         }
 
         proto::UpdateRepository {
+            is_read_only: self.is_read_only,
             branch_summary: self.branch.as_ref().map(branch_to_proto),
             branch_list: self.branch_list.iter().map(branch_to_proto).collect(),
             branch_list_error: self
@@ -8095,6 +8128,9 @@ impl Repository {
         entries: Vec<RepoPath>,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
+        if self.is_read_only() {
+            return Task::ready(Err(anyhow!("external VCS provider is read-only")));
+        }
         if entries.is_empty() {
             return Task::ready(Ok(()));
         }
@@ -10046,6 +10082,7 @@ impl Repository {
         update: proto::UpdateRepository,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        self.snapshot.is_read_only = update.is_read_only;
         if let Some(repository_dir_abs_path) = &update.repository_dir_abs_path {
             self.snapshot.repository_dir_abs_path =
                 Path::new(repository_dir_abs_path.as_str()).into();
@@ -10227,11 +10264,6 @@ impl Repository {
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut Context<Self>,
     ) {
-        let updates_tx = if self.is_read_only() {
-            None
-        } else {
-            updates_tx
-        };
         let this = cx.weak_entity();
         let _ = self.send_keyed_job(
             "schedule_scan",
@@ -10558,11 +10590,6 @@ impl Repository {
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut Context<Self>,
     ) {
-        let updates_tx = if self.is_read_only() {
-            None
-        } else {
-            updates_tx
-        };
         if !paths.is_empty() {
             self.paths_needing_status_update.push(paths);
         }

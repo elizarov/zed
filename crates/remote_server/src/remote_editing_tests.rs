@@ -3523,6 +3523,268 @@ async fn test_add_path_to_git_info_exclude_in_remote_repository(
 }
 
 #[gpui::test]
+async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
+    use git::repository::repo_path;
+    use project::{git_store::GitStoreEvent, project_settings::ProjectSettings, trusted_worktrees};
+    use std::time::Duration;
+
+    cx.executor().allow_parking();
+    server_cx.update(|cx| trusted_worktrees::init(Default::default(), cx));
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let state_path = root.join("provider-state.json");
+    smol::fs::write(
+        &state_path,
+        json!({
+            "snapshot": "1", "changes": [
+                {"path": "hello.txt", "status": "modified", "stagedStatus": "modified"},
+                {"path": "gone.txt", "status": "deleted"}
+            ]
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(&root, json!({"hello.txt": "working copy\n"}))
+        .await;
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(root.clone(), true, cx)
+        })
+        .await
+        .unwrap();
+    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+    let store = project.read_with(cx, |project, _| project.git_store().clone());
+    let remote = project.read_with(cx, |project, _| project.remote_client().unwrap());
+    let client = remote.read_with(cx, |remote, _| remote.proto_client());
+    let server_store = headless.read_with(server_cx, |headless, _| headless.git_store.clone());
+
+    // Local commands, including overrides, must never be executed on the remote host.
+    cx.update_global::<SettingsStore, _>(|settings, cx| settings.set_user_settings(&json!({
+        "vcs_provider": {"command": "/client-only/provider"},
+        "dev": {"vcs_provider": {"command": "/client-only/dev-provider"}},
+        "linux": {"vcs_provider": {"command": "/client-only/linux-provider"}},
+        "profiles": {"work": {"settings": {"vcs_provider": {"command": "/client-only/profile-provider"}}}}
+    }).to_string(), cx)).unwrap();
+    cx.run_until_parked();
+    server_cx.read(|cx| assert!(ProjectSettings::get_global(cx).vcs_provider.is_none()));
+
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../vcs_provider/tests/mock_provider.py");
+    server_cx
+        .update_global::<SettingsStore, _>(|settings, cx| {
+            settings.set_server_settings(
+                &json!({
+                    "vcs_provider": {
+                        "command": "python3", "args": [fixture, "remote", state_path],
+                        "env": {"VCS_PROVIDER_TEST_HOST": "server"}, "poll_interval_ms": 60000
+                    }
+                })
+                .to_string(),
+                cx,
+            )
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(server_store.read_with(server_cx, |store, _| store.active_repository().is_none()));
+    assert!(store.read_with(cx, |store, _| store.active_repository().is_none()));
+
+    // Exercise the same trust RPC used by the SSH client.
+    client
+        .request(proto::TrustWorktrees {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            trusted_paths: vec![proto::PathTrust {
+                content: Some(proto::path_trust::Content::WorktreeId(
+                    worktree_id.to_proto(),
+                )),
+            }],
+        })
+        .await
+        .unwrap();
+    store
+        .condition::<GitStoreEvent>(cx, |store, cx| {
+            store.active_repository().is_some_and(|repo| {
+                repo.read(cx)
+                    .status_for_path(&repo_path("hello.txt"))
+                    .is_some()
+            })
+        })
+        .await;
+    let repository = store.read_with(cx, |store, cx| {
+        let repository = store.active_repository().unwrap();
+        assert!(repository.read(cx).is_read_only());
+        assert_eq!(
+            repository.read(cx).work_directory_abs_path.as_ref(),
+            root.as_path()
+        );
+        assert!(
+            repository
+                .read(cx)
+                .status_for_path(&repo_path("gone.txt"))
+                .is_some()
+        );
+        repository
+    });
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("hello.txt")), cx)
+        })
+        .await
+        .unwrap();
+    let diff = project
+        .update(cx, |project, cx| {
+            project.open_uncommitted_diff(buffer.clone(), cx)
+        })
+        .await
+        .unwrap();
+    diff.read_with(cx, |diff, cx| {
+        assert_eq!(diff.base_text_string(cx).unwrap(), "base-1\n");
+        assert_eq!(
+            diff.secondary_diff()
+                .unwrap()
+                .read(cx)
+                .base_text_string(cx)
+                .unwrap(),
+            "index-1\n"
+        );
+        let operations = diff.operations().unwrap();
+        assert!(!operations.supports_staging());
+        assert!(!operations.supports_unstaging());
+        assert!(!operations.supports_restore());
+    });
+    // A client bypassing the disabled UI still cannot mutate the provider.
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "unsaved\n")], None, cx)
+    });
+    let repository_id = repository.read_with(cx, |repo, _| repo.id.to_proto());
+    assert!(
+        client
+            .request(proto::Stage {
+                project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                repository_id,
+                paths: vec!["hello.txt".into()],
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        repository
+            .update(cx, |repo, cx| repo.stage_all(cx))
+            .await
+            .is_err()
+    );
+    assert!(
+        repository
+            .update(cx, |repo, _| repo
+                .add_path_to_gitignore(&repo_path("hello.txt"), false))
+            .await
+            .unwrap()
+            .is_err()
+    );
+
+    smol::fs::write(
+        &state_path,
+        json!({
+            "snapshot": "2", "changes": [{"path": "hello.txt", "status": "modified"}]
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(60));
+    store
+        .condition::<GitStoreEvent>(cx, |store, cx| {
+            store.active_repository().is_some_and(|repo| {
+                repo.read(cx)
+                    .status_for_path(&repo_path("gone.txt"))
+                    .is_none()
+            })
+        })
+        .await;
+    let server_repository =
+        server_store.read_with(server_cx, |store, _| store.active_repository().unwrap());
+    server_repository
+        .update(server_cx, |repo, _| repo.barrier())
+        .await
+        .unwrap();
+    diff.condition(cx, |diff, cx| {
+        diff.base_text_string(cx).as_deref() == Some("base-2\n")
+            && diff.secondary_diff().is_some_and(|diff| {
+                diff.read(cx).base_text_string(cx).as_deref() == Some("index-2\n")
+            })
+    })
+    .await;
+    diff.read_with(cx, |diff, cx| {
+        assert_eq!(diff.base_text_string(cx).unwrap(), "base-2\n");
+        assert_eq!(
+            diff.secondary_diff()
+                .unwrap()
+                .read(cx)
+                .base_text_string(cx)
+                .unwrap(),
+            "index-2\n"
+        );
+    });
+
+    // Resharing sends the complete read-only snapshot, not only subsequent deltas.
+    headless.update(server_cx, |headless, cx| {
+        headless.git_store.update(cx, |store, cx| {
+            store.unshared(cx);
+            store.shared(
+                proto::REMOTE_SERVER_PROJECT_ID,
+                headless.session.clone(),
+                cx,
+            );
+        })
+    });
+    cx.run_until_parked();
+    assert!(repository.read_with(cx, |repo, _| repo.is_read_only()));
+
+    client
+        .request(proto::RestrictWorktrees {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            worktree_ids: vec![worktree_id.to_proto()],
+        })
+        .await
+        .unwrap();
+    store
+        .condition::<GitStoreEvent>(cx, |store, _| store.active_repository().is_none())
+        .await;
+    assert!(!server_repository.read_with(server_cx, |repo, _| repo.is_trusted()));
+    assert!(server_store.read_with(server_cx, |store, _| store.active_repository().is_none()));
+    client
+        .request(proto::TrustWorktrees {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            trusted_paths: vec![proto::PathTrust {
+                content: Some(proto::path_trust::Content::WorktreeId(
+                    worktree_id.to_proto(),
+                )),
+            }],
+        })
+        .await
+        .unwrap();
+    store
+        .condition::<GitStoreEvent>(cx, |store, cx| {
+            store.active_repository().is_some_and(|repo| {
+                repo.read(cx)
+                    .status_for_path(&repo_path("hello.txt"))
+                    .is_some()
+            })
+        })
+        .await;
+    assert!(store.read_with(cx, |store, cx| {
+        store.active_repository().unwrap().read(cx).is_read_only()
+    }));
+    assert!(fs.metadata(&root.join(".git")).await.unwrap().is_none());
+    assert_eq!(
+        fs.load(&root.join("hello.txt")).await.unwrap(),
+        "working copy\n"
+    );
+}
+
+#[gpui::test]
 async fn test_remote_git_diffs(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let text_2 = "
         fn one() -> usize {
