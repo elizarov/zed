@@ -613,6 +613,8 @@ pub enum CommitDataState {
 pub struct RepositorySnapshot {
     pub id: RepositoryId,
     pub is_read_only: bool,
+    pub capabilities: git::repository::RepositoryCapabilities,
+    pub references_version: Option<String>,
     pub statuses_by_path: SumTree<StatusEntry>,
     pub work_directory_abs_path: Arc<Path>,
     pub dot_git_abs_path: Arc<Path>,
@@ -2325,6 +2327,12 @@ impl GitStore {
         else {
             return Task::ready(Err(anyhow!("failed to find a git repository for buffer")));
         };
+        if !repo
+            .read(cx)
+            .supports(git::repository::RepositoryCapabilities::BLAME)
+        {
+            return Task::ready(Ok(None));
+        }
         let content = match &version {
             Some(version) => buffer.rope_for_version(version),
             None => buffer.as_rope().clone(),
@@ -2431,6 +2439,12 @@ impl GitStore {
         target: PermalinkTarget,
         cx: &mut App,
     ) -> Task<Result<url::Url>> {
+        if !repo
+            .read(cx)
+            .supports(git::repository::RepositoryCapabilities::PERMALINKS)
+        {
+            return Task::ready(Err(anyhow!("VCS provider does not support permalinks")));
+        }
         let branch = repo.read(cx).branch.clone();
         let remote = branch
             .as_ref()
@@ -6296,6 +6310,8 @@ impl RepositorySnapshot {
         Self {
             id,
             is_read_only: false,
+            capabilities: git::repository::RepositoryCapabilities::all(),
+            references_version: None,
             statuses_by_path: Default::default(),
             repository_dir_abs_path,
             dot_git_abs_path,
@@ -6318,6 +6334,8 @@ impl RepositorySnapshot {
     fn initial_update(&self, project_id: u64) -> proto::UpdateRepository {
         proto::UpdateRepository {
             is_read_only: self.is_read_only,
+            capabilities: Some(self.capabilities.bits()),
+            references_version: self.references_version.clone(),
             branch_summary: self.branch.as_ref().map(branch_to_proto),
             branch_list: self.branch_list.iter().map(branch_to_proto).collect(),
             branch_list_error: self
@@ -6410,6 +6428,8 @@ impl RepositorySnapshot {
 
         proto::UpdateRepository {
             is_read_only: self.is_read_only,
+            capabilities: Some(self.capabilities.bits()),
+            references_version: self.references_version.clone(),
             branch_summary: self.branch.as_ref().map(branch_to_proto),
             branch_list: self.branch_list.iter().map(branch_to_proto).collect(),
             branch_list_error: self
@@ -7397,6 +7417,15 @@ impl Repository {
         commit: String,
         ignore_shallow_boundary: bool,
     ) -> oneshot::Receiver<Result<CommitDiff>> {
+        if !self.supports(git::repository::RepositoryCapabilities::HISTORY) {
+            let (sender, receiver) = oneshot::channel();
+            sender
+                .send(Err(anyhow!(
+                    "VCS provider does not support load commit diff"
+                )))
+                .ok();
+            return receiver;
+        }
         let id = self.id;
         self.send_job("load_commit_diff", None, move |git_repo, cx| async move {
             match git_repo {
@@ -7543,6 +7572,13 @@ impl Repository {
         range: Range<usize>,
         cx: &mut Context<Self>,
     ) -> GraphDataResponse<'_> {
+        if !self.supports(git::repository::RepositoryCapabilities::HISTORY) {
+            return GraphDataResponse {
+                commits: &[],
+                is_loading: false,
+                error: Some("VCS provider does not support history".into()),
+            };
+        }
         let initial_commit_data = self
             .initial_graph_data
             .entry((log_source.clone(), log_order))
@@ -9322,6 +9358,13 @@ impl Repository {
     }
 
     pub fn branches(&mut self) -> oneshot::Receiver<Result<BranchesScanResult>> {
+        if !self.supports(git::repository::RepositoryCapabilities::BRANCHES) {
+            let (sender, receiver) = oneshot::channel();
+            sender
+                .send(Err(anyhow!("VCS provider does not support branches")))
+                .ok();
+            return receiver;
+        }
         let id = self.id;
         self.send_job("branches", None, move |repo, _| async move {
             match repo {
@@ -9388,6 +9431,13 @@ impl Repository {
     }
 
     pub fn worktrees(&mut self) -> oneshot::Receiver<Result<Vec<GitWorktree>>> {
+        if !self.supports(git::repository::RepositoryCapabilities::WORKTREES) {
+            let (sender, receiver) = oneshot::channel();
+            sender
+                .send(Err(anyhow!("VCS provider does not support worktrees")))
+                .ok();
+            return receiver;
+        }
         let id = self.id;
         self.send_job("worktrees", None, move |repo, _| async move {
             match repo {
@@ -9794,6 +9844,13 @@ impl Repository {
         &mut self,
         include_remote_name: bool,
     ) -> oneshot::Receiver<Result<Option<SharedString>>> {
+        if !self.supports(git::repository::RepositoryCapabilities::BRANCH_DIFF) {
+            let (sender, receiver) = oneshot::channel();
+            sender
+                .send(Err(anyhow!("VCS provider does not support default branch")))
+                .ok();
+            return receiver;
+        }
         let id = self.id;
         self.send_job("default_branch", None, move |repo, _| async move {
             match repo {
@@ -9820,6 +9877,13 @@ impl Repository {
         diff_type: DiffTreeType,
         _cx: &App,
     ) -> oneshot::Receiver<Result<TreeDiff>> {
+        if !self.supports(git::repository::RepositoryCapabilities::BRANCH_DIFF) {
+            let (sender, receiver) = oneshot::channel();
+            sender
+                .send(Err(anyhow!("VCS provider does not support diff tree")))
+                .ok();
+            return receiver;
+        }
         let repository_id = self.snapshot.id;
         self.send_job("diff_tree", None, move |repo, _cx| async move {
             match repo {
@@ -9886,6 +9950,13 @@ impl Repository {
     }
 
     pub fn diff(&mut self, diff_type: DiffType, _cx: &App) -> oneshot::Receiver<Result<String>> {
+        if !self.supports(git::repository::RepositoryCapabilities::BRANCH_DIFF) {
+            let (sender, receiver) = oneshot::channel();
+            sender
+                .send(Err(anyhow!("VCS provider does not support diff")))
+                .ok();
+            return receiver;
+        }
         let id = self.id;
         self.send_job("diff", None, move |repo, _cx| async move {
             match repo {
@@ -10130,6 +10201,15 @@ impl Repository {
         cx: &mut Context<Self>,
     ) -> Result<()> {
         self.snapshot.is_read_only = update.is_read_only;
+        self.snapshot.capabilities = git::repository::RepositoryCapabilities::from_remote(
+            update.capabilities,
+            update.is_read_only,
+        );
+        if self.snapshot.references_version != update.references_version {
+            self.snapshot.references_version = update.references_version.clone();
+            self.initial_graph_data.clear();
+            cx.emit(RepositoryEvent::BranchListChanged);
+        }
         if let Some(repository_dir_abs_path) = &update.repository_dir_abs_path {
             self.snapshot.repository_dir_abs_path =
                 Path::new(repository_dir_abs_path.as_str()).into();
@@ -10560,6 +10640,11 @@ impl Repository {
         revision: Oid,
         cx: &App,
     ) -> Task<Result<(String, git::blame::Blame)>> {
+        if !self.supports(git::repository::RepositoryCapabilities::BLAME) {
+            return Task::ready(Err(anyhow!(
+                "VCS provider does not support historical blame"
+            )));
+        }
         let repository_id = self.snapshot.id;
         let rx = self.send_job("blame_buffer_at_revision", None, {
             let path = path.clone();
@@ -11433,6 +11518,10 @@ fn branch_to_proto(branch: &git::repository::Branch) -> proto::Branch {
             .map(|commit| commit.commit_timestamp as u64),
         upstream: branch.upstream.as_ref().map(|upstream| proto::GitUpstream {
             ref_name: upstream.ref_name.to_string(),
+            tracking_unknown: matches!(
+                upstream.tracking,
+                git::repository::UpstreamTracking::Unknown
+            ),
             tracking: upstream
                 .tracking
                 .status()
@@ -11499,7 +11588,11 @@ fn proto_to_branch(proto: &proto::Branch) -> git::repository::Branch {
                             behind: tracking.behind as u32,
                         })
                     })
-                    .unwrap_or(git::repository::UpstreamTracking::Gone),
+                    .unwrap_or(if upstream.tracking_unknown {
+                        git::repository::UpstreamTracking::Unknown
+                    } else {
+                        git::repository::UpstreamTracking::Gone
+                    }),
             }),
         most_recent_commit: proto.most_recent_commit.as_ref().map(|commit| {
             git::repository::CommitSummary {
@@ -12560,7 +12653,16 @@ async fn compute_snapshot(
     };
     let worktrees_future = {
         let backend = backend.clone();
-        async move { backend.worktrees().await.log_err().unwrap_or_default() }
+        async move {
+            if backend
+                .capabilities()
+                .contains(git::repository::RepositoryCapabilities::WORKTREES)
+            {
+                backend.worktrees().await.log_err().unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
     };
     let (branches, head_commit, all_worktrees) =
         futures::future::join3(branches_future, head_commit_future, worktrees_future).await;
@@ -12636,7 +12738,11 @@ async fn compute_snapshot(
         let snapshot = snapshot.clone();
         let backend = backend.clone();
         async move {
-            if snapshot.head_commit.is_some() {
+            if snapshot.head_commit.is_some()
+                && backend
+                    .capabilities()
+                    .contains(git::repository::RepositoryCapabilities::DIFF_STATS)
+            {
                 futures::future::join3(
                     backend.diff_stat(DiffStatType::HeadToWorktree, &[]),
                     backend.diff_stat(DiffStatType::HeadToIndex, &[]),
@@ -12654,7 +12760,16 @@ async fn compute_snapshot(
     };
     let stash_entries_future = {
         let backend = backend.clone();
-        async move { backend.stash_entries().await.log_err().unwrap_or_default() }
+        async move {
+            if backend
+                .capabilities()
+                .contains(git::repository::RepositoryCapabilities::STASHES)
+            {
+                backend.stash_entries().await.log_err().unwrap_or_default()
+            } else {
+                GitStash::default()
+            }
+        }
     };
 
     let (statuses, diff_stats, stash_entries) =

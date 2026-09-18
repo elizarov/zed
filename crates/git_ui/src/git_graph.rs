@@ -1196,6 +1196,18 @@ pub fn open_or_reuse_graph(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    if git_store
+        .read(cx)
+        .repositories()
+        .get(&repo_id)
+        .is_some_and(|repo| {
+            !repo
+                .read(cx)
+                .supports(git::repository::RepositoryCapabilities::HISTORY)
+        })
+    {
+        return;
+    }
     let existing = workspace.items_of_type::<GitGraph>(cx).find(|graph| {
         let graph = graph.read(cx);
         graph.repo_id == repo_id && graph.log_source == log_source

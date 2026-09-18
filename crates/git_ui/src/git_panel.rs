@@ -33,8 +33,8 @@ use git::commit::ParsedCommitMessage;
 use git::repository::{
     Branch, CommitData, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions,
     GitCommitTemplate, GitCommitter, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
-    Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus,
-    get_git_committer,
+    Remote, RemoteCommandOutput, RepositoryCapabilities, ResetMode, Upstream, UpstreamTracking,
+    UpstreamTrackingStatus, get_git_committer,
 };
 use git::stash::GitStash;
 use git::status::{DiffStat, StageStatus};
@@ -112,7 +112,7 @@ const GIT_PANEL_KEY: &str = "GitPanel";
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
-const MAX_HISTORY_TAG_CHIPS: usize = 3;
+const MAX_HISTORY_REF_CHIPS: usize = 3;
 // Horizontal offset that aligns the tree indent guides with the row icon column.
 const INDENT_GUIDE_LEFT_OFFSET: gpui::Pixels = gpui::px(19.);
 
@@ -1177,6 +1177,7 @@ struct BulkStaging {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CommitHistoryEntry {
     sha: Oid,
+    ref_names: Vec<SharedString>,
     tag_names: Vec<SharedString>,
 }
 
@@ -1184,6 +1185,7 @@ impl From<&Arc<InitialGraphCommitData>> for CommitHistoryEntry {
     fn from(commit: &Arc<InitialGraphCommitData>) -> Self {
         Self {
             sha: commit.sha,
+            ref_names: commit.ref_names.clone(),
             tag_names: commit
                 .tag_names()
                 .into_iter()
@@ -6482,7 +6484,35 @@ impl GitPanel {
     pub(crate) fn render_remote_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let branch = self.active_repository.as_ref()?.read(cx).branch.clone();
         if !self.can_push_and_pull(cx) {
-            return None;
+            let repository = self.active_repository.as_ref()?.read(cx);
+            if !repository.supports(RepositoryCapabilities::TRACKING) {
+                return None;
+            }
+            let upstream = branch.as_ref()?.upstream.as_ref()?;
+            let (label, detail) = match &upstream.tracking {
+                UpstreamTracking::Tracked(status) => (
+                    format!("↑{} ↓{}", status.ahead, status.behind),
+                    format!(
+                        "{}: {} ahead, {} behind",
+                        upstream.ref_name, status.ahead, status.behind
+                    ),
+                ),
+                UpstreamTracking::Unknown => (
+                    "↑? ↓?".to_owned(),
+                    format!("{}: tracking counts unavailable", upstream.ref_name),
+                ),
+                UpstreamTracking::Gone => (
+                    "upstream gone".to_owned(),
+                    format!("{}: upstream is no longer available", upstream.ref_name),
+                ),
+            };
+            return Some(
+                div()
+                    .id("upstream-tracking")
+                    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                    .tooltip(Tooltip::text(detail))
+                    .into_any_element(),
+            );
         }
         Some(
             h_flex()
@@ -7024,6 +7054,14 @@ impl GitPanel {
         v_flex().flex_1().size_full().overflow_hidden().map(|this| {
             let has_repo = self.active_repository.is_some();
             match &self.commit_history {
+                _ if self.active_repository.as_ref().is_some_and(|repo| {
+                    !repo.read(cx).supports(RepositoryCapabilities::HISTORY)
+                }) =>
+                {
+                    this.child(Self::render_history_placeholder(
+                        "History is not supported by this VCS provider",
+                    ))
+                }
                 _ if !has_repo => {
                     this.child(self.render_repository_discovery(cx).unwrap_or_else(|| {
                         Self::render_history_placeholder("No repository found").into_any_element()
@@ -7264,6 +7302,9 @@ impl GitPanel {
         cx: &App,
     ) -> Option<LogSource> {
         let repository = active_repository.read(cx);
+        if !repository.supports(RepositoryCapabilities::HISTORY) {
+            return None;
+        }
         let head_commit = repository.head_commit.as_ref()?;
         if let Some(branch) = repository.branch.as_ref() {
             Some(LogSource::Branch(branch.name().to_string().into()))
@@ -7358,7 +7399,7 @@ impl GitPanel {
                                     let sha_shared: SharedString = sha_string.clone().into();
                                     let short_sha: SharedString =
                                         sha_string[..7.min(sha_string.len())].to_string().into();
-                                    let tag_names = entry.tag_names.clone();
+                                    let ref_names = entry.ref_names.clone();
 
                                     let (subject, author_name, author_email, timestamp): (
                                         SharedString,
@@ -7441,40 +7482,40 @@ impl GitPanel {
                                                 .w_full()
                                                 .min_w_0()
                                                 .child(Label::new(subject).truncate())
-                                                .children((!tag_names.is_empty()).then(|| {
-                                                    let hidden_tag_count = tag_names
+                                                .children((!ref_names.is_empty()).then(|| {
+                                                    let hidden_ref_count = ref_names
                                                         .len()
-                                                        .saturating_sub(MAX_HISTORY_TAG_CHIPS);
+                                                        .saturating_sub(MAX_HISTORY_REF_CHIPS);
                                                     h_flex()
                                                         .gap_1()
                                                         .min_w_0()
                                                         .children(
-                                                            tag_names
+                                                            ref_names
                                                                 .iter()
-                                                                .take(MAX_HISTORY_TAG_CHIPS)
-                                                                .map(|tag_name| {
-                                                                    let tag_name = tag_name.clone();
-                                                                    Chip::new(tag_name.clone())
+                                                                .take(MAX_HISTORY_REF_CHIPS)
+                                                                .map(|ref_name| {
+                                                                    let ref_name = ref_name.clone();
+                                                                    Chip::new(ref_name.clone())
                                                                         .truncate()
                                                                         .when(
                                                                             !has_context_menu,
                                                                             |chip| {
                                                                                 chip.tooltip(
                                                                                     Tooltip::text(
-                                                                                        tag_name,
+                                                                                        ref_name,
                                                                                     ),
                                                                                 )
                                                                             },
                                                                         )
                                                                 }),
                                                         )
-                                                        .when(hidden_tag_count > 0, |this| {
-                                                            let hidden_tag_names = tag_names
-                                                                [MAX_HISTORY_TAG_CHIPS..]
+                                                        .when(hidden_ref_count > 0, |this| {
+                                                            let hidden_ref_names = ref_names
+                                                                [MAX_HISTORY_REF_CHIPS..]
                                                                 .join(", ");
                                                             this.child(
                                                                 Chip::new(format!(
-                                                                    "+{hidden_tag_count}"
+                                                                    "+{hidden_ref_count}"
                                                                 ))
                                                                 .bg_color(
                                                                     cx.theme()
@@ -7484,7 +7525,7 @@ impl GitPanel {
                                                                 )
                                                                 .when(!has_context_menu, |chip| {
                                                                     chip.tooltip(Tooltip::text(
-                                                                        hidden_tag_names,
+                                                                        hidden_ref_names,
                                                                     ))
                                                                 }),
                                                             )
@@ -7629,7 +7670,12 @@ impl GitPanel {
     }
 
     fn render_no_changes_ui(&self, cx: &Context<Self>) -> AnyElement {
-        let show_branch_diff = self.changes_count == 0 && !self.is_on_main_branch(cx);
+        let show_branch_diff = self.changes_count == 0
+            && !self.is_on_main_branch(cx)
+            && self
+                .active_repository
+                .as_ref()
+                .is_some_and(|repo| repo.read(cx).supports(RepositoryCapabilities::BRANCH_DIFF));
 
         v_flex()
             .gap_1()
@@ -9472,23 +9518,67 @@ impl RenderOnce for PanelRepoFooter {
             })
             .into_any_element();
 
+        let read_only = repo
+            .as_ref()
+            .and_then(|repo| repo.as_ref())
+            .is_some_and(|repo| repo.read(cx).is_read_only());
+        let can_browse = repo
+            .as_ref()
+            .and_then(|repo| repo.as_ref())
+            .is_none_or(|repo| repo.read(cx).supports(RepositoryCapabilities::BRANCHES));
         let branch_selector_button = Button::new("branch-selector", branch_name)
+            .disabled(!can_browse)
             .size(ButtonSize::None)
             .label_size(LabelSize::Small)
             .truncate(true)
-            .on_click(|_, window, cx| {
-                window.dispatch_action(zed_actions::git::Switch.boxed_clone(), cx);
+            .when(!read_only, |button| {
+                button.on_click(|_, window, cx| {
+                    window.dispatch_action(zed_actions::git::Switch.boxed_clone(), cx);
+                })
             });
 
         let branch_selector = PopoverMenu::new("popover-button")
             .menu(move |window, cx| {
                 let workspace = workspace.clone()?;
                 let repo = repo.clone().flatten();
-                Some(branch_picker::popover(workspace, false, repo, window, cx))
+                if read_only {
+                    let repository = repo.clone()?;
+                    let repo_id = repository.read(cx).id;
+                    let git_store = repository.read(cx).git_store()?;
+                    let target_workspace = workspace.clone();
+                    let on_select =
+                        Arc::new(move |branch: Branch, window: &mut Window, cx: &mut App| {
+                            target_workspace
+                                .update(cx, |workspace, cx| {
+                                    crate::git_graph::open_or_reuse_graph(
+                                        workspace,
+                                        repo_id,
+                                        git_store.clone(),
+                                        LogSource::Branch(branch.ref_name.clone()),
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .log_err();
+                        });
+                    Some(branch_picker::select_popover(
+                        workspace, repo, None, on_select, window, cx,
+                    ))
+                } else {
+                    Some(branch_picker::popover(workspace, false, repo, window, cx))
+                }
             })
             .trigger_with_tooltip(
                 branch_selector_button,
-                Tooltip::for_action_title("Switch Branch", &zed_actions::git::Switch),
+                Tooltip::for_action_title(
+                    if read_only {
+                        "Browse Branch History"
+                    } else {
+                        "Switch Branch"
+                    },
+                    &zed_actions::git::Switch,
+                ),
             )
             .anchor(Anchor::BottomLeft)
             .offset(gpui::Point {
@@ -10502,6 +10592,7 @@ mod tests {
                 panel.commit_history,
                 CommitHistory::Loaded(Rc::from([CommitHistoryEntry {
                     sha,
+                    ref_names: Vec::new(),
                     tag_names: Vec::new(),
                 }]))
             );
@@ -10558,6 +10649,7 @@ mod tests {
         let error = SharedString::from("git log failed");
         let entries: Rc<[CommitHistoryEntry]> = Rc::from([CommitHistoryEntry {
             sha,
+            ref_names: Vec::new(),
             tag_names: Vec::new(),
         }]);
         let no_entries: Rc<[CommitHistoryEntry]> = Rc::from([]);

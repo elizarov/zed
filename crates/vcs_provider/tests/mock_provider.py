@@ -17,6 +17,16 @@ def send(value):
     sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
     sys.stdout.buffer.flush()
 
+def references(branch="main", tag_revision="revision-2"):
+    return [
+        {"kind": "branch", "name": branch, "revision": "revision-2", "upstream": {"name": "origin/main", "ahead": 2, "behind": 1}},
+        {"kind": "branch", "name": "topic", "revision": "revision-1", "upstream": {"name": "origin/topic"}},
+        {"kind": "branch", "name": "gone", "revision": "revision-1", "upstream": {"name": "origin/gone", "gone": True}},
+        {"kind": "remoteBranch", "name": "origin/main", "revision": "revision-1"},
+        {"kind": "tag", "name": "v1", "revision": tag_revision},
+        {"kind": "tag", "name": "main", "revision": "revision-1"},
+    ]
+
 while True:
     header = sys.stdin.buffer.readline()
     if not header:
@@ -34,6 +44,12 @@ while True:
         continue
     if method == "initialize":
         result = {"protocolVersion": "9.0" if mode == "version" else "0.1", "capabilities": {"readOnly": True, "staging": True, "history": mode.startswith("history") or mode == "remote"}}
+        if mode in {"history-refs", "remote"} or mode.startswith("bad-refs"):
+            result["capabilities"].update(branches=True, tags=True, tracking=True)
+        if mode == "bad-tracking":
+            result["capabilities"]["tracking"] = True
+        if mode == "reserved-feature":
+            result["capabilities"]["blame"] = True
     elif method == "repository/discover":
         root = message["params"]["workspaceRoot"]
         if mode == "remote":
@@ -50,6 +66,13 @@ while True:
             {"path": "new.txt", "status": "untracked"},
             {"path": "deleted.txt", "status": "deleted"},
         ]}
+        if mode == "history-refs" or mode.startswith("bad-refs"):
+            result["references"] = references()
+            if mode == "bad-refs-duplicate": result["references"].append(result["references"][0])
+            if mode == "bad-refs-name": result["references"][0]["name"] = "bad\nname"
+            if mode == "bad-refs-counts": del result["references"][0]["upstream"]["ahead"]
+            if mode == "bad-refs-gone": result["references"][0]["upstream"]["gone"] = True
+        if mode == "unadvertised-refs": result["references"] = references()
         if mode == "remote":
             state_path = Path(sys.argv[2])
             state = json.loads(state_path.read_text())
@@ -59,7 +82,7 @@ while True:
             if state.get("failStatus"):
                 send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32000, "message": "mock startup failed"}})
                 continue
-            result = {"snapshot": state["snapshot"], "revision": "revision-2", "branch": "remote-branch", "changes": state["changes"]}
+            result = {"snapshot": state["snapshot"], "revision": "revision-2", "branch": "remote-branch", "changes": state["changes"], "references": references("remote-branch", state.get("tagRevision", "revision-2"))}
         send({"jsonrpc": "2.0", "method": "repository/changed", "params": {"repository": "mock"}})
     elif method == "repository/comparison":
         comparison_counter += 1
@@ -75,6 +98,7 @@ while True:
         if method == "repository/commitDetails":
             result = next(commit for commit in commits if commit["id"] == message["params"]["revision"])
         else:
+            if message["params"]["revision"] == "revision-1": commits = commits[1:]
             limit = message["params"]["limit"]
             result = {"commits": commits[:limit], "hasMore": limit < len(commits)}
             if mode == "history-bad-id":

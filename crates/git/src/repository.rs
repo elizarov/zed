@@ -486,6 +486,8 @@ pub struct CommitOptions {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum UpstreamTracking {
+    /// The upstream exists, but divergence counts are unavailable.
+    Unknown,
     /// Remote ref not present in local repository.
     Gone,
     /// Remote ref present in local repository (fetched from remote).
@@ -505,7 +507,7 @@ impl UpstreamTracking {
 
     pub fn status(&self) -> Option<UpstreamTrackingStatus> {
         match self {
-            UpstreamTracking::Gone => None,
+            UpstreamTracking::Gone | UpstreamTracking::Unknown => None,
             UpstreamTracking::Tracked(status) => Some(*status),
         }
     }
@@ -808,7 +810,40 @@ pub fn delete_branch_flag(is_remote_tracking_ref: bool, force: bool) -> &'static
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RepositoryCapabilities: u64 {
+        const STAGING = 1 << 0;
+        const HISTORY = 1 << 1;
+        const BRANCHES = 1 << 2;
+        const TAGS = 1 << 3;
+        const TRACKING = 1 << 4;
+        const BLAME = 1 << 5;
+        const BRANCH_DIFF = 1 << 6;
+        const PERMALINKS = 1 << 7;
+        const DIFF_STATS = 1 << 8;
+        const STASHES = 1 << 9;
+        const WORKTREES = 1 << 10;
+    }
+}
+
+impl RepositoryCapabilities {
+    pub fn from_remote(bits: Option<u64>, read_only: bool) -> Self {
+        bits.map(Self::from_bits_truncate).unwrap_or_else(|| {
+            if read_only {
+                Self::STAGING | Self::HISTORY
+            } else {
+                Self::all()
+            }
+        })
+    }
+}
+
 pub trait GitRepository: Send + Sync {
+    fn capabilities(&self) -> RepositoryCapabilities {
+        RepositoryCapabilities::all()
+    }
+
     fn is_read_only(&self) -> bool {
         false
     }

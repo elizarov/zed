@@ -15,6 +15,70 @@ use std::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Capabilities {
+    pub read_only: bool,
+    pub staging: bool,
+    #[serde(default)]
+    pub history: bool,
+    #[serde(default)]
+    pub branches: bool,
+    #[serde(default)]
+    pub tags: bool,
+    #[serde(default)]
+    pub tracking: bool,
+    #[serde(default)]
+    pub blame: bool,
+    #[serde(default)]
+    pub branch_diff: bool,
+    #[serde(default)]
+    pub permalinks: bool,
+    #[serde(default)]
+    pub diff_stats: bool,
+    #[serde(default)]
+    pub stashes: bool,
+    #[serde(default)]
+    pub worktrees: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReferenceKind {
+    Branch,
+    RemoteBranch,
+    Tag,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Reference {
+    pub name: String,
+    pub kind: ReferenceKind,
+    pub revision: String,
+    pub upstream: Option<Tracking>,
+    pub commit: Option<ReferenceCommit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceCommit {
+    pub timestamp: i64,
+    pub subject: String,
+    pub author_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Tracking {
+    pub name: String,
+    #[serde(default)]
+    pub gone: bool,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+}
+
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -59,11 +123,53 @@ pub struct Snapshot {
     pub revision: Option<String>,
     pub branch: Option<String>,
     pub changes: Vec<Change>,
+    #[serde(default)]
+    pub references: Vec<Reference>,
 }
 
 impl Snapshot {
+    fn validate_capabilities(&self, capabilities: Capabilities) -> Result<()> {
+        for reference in &self.references {
+            ensure!(
+                match reference.kind {
+                    ReferenceKind::Tag => capabilities.tags,
+                    _ => capabilities.branches,
+                },
+                "reference requires its advertised capability"
+            );
+            ensure!(
+                reference.upstream.is_none() || capabilities.tracking,
+                "upstream requires tracking capability"
+            );
+        }
+        Ok(())
+    }
     fn validate(&self) -> Result<()> {
         ensure!(!self.snapshot.is_empty(), "empty snapshot token");
+        let mut references = HashSet::new();
+        for reference in &self.references {
+            validate_reference_name(&reference.name)?;
+            validate_revision(&reference.revision)?;
+            ensure!(
+                references.insert((reference.kind as u8, &reference.name)),
+                "duplicate reference"
+            );
+            if let Some(upstream) = &reference.upstream {
+                ensure!(
+                    reference.kind == ReferenceKind::Branch,
+                    "only local branches track upstreams"
+                );
+                validate_reference_name(&upstream.name)?;
+                ensure!(
+                    upstream.ahead.is_some() == upstream.behind.is_some(),
+                    "incomplete tracking counts"
+                );
+                ensure!(
+                    !upstream.gone || upstream.ahead.is_none(),
+                    "gone upstream has tracking counts"
+                );
+            }
+        }
         let mut paths = HashSet::new();
         for change in &self.changes {
             validate_path(&change.path)?;
@@ -132,6 +238,14 @@ pub struct CommitChange {
     pub path: String,
     pub base: Option<String>,
     pub target: Option<String>,
+}
+
+fn validate_reference_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty() && name.len() <= 4096 && !name.chars().any(char::is_control),
+        "invalid reference name"
+    );
+    Ok(())
 }
 
 fn validate_revision(revision: &str) -> Result<()> {
@@ -318,8 +432,7 @@ impl Connection {
 pub struct Client {
     transport: std::sync::Arc<Mutex<Connection>>,
     pub repository: RepositoryInfo,
-    pub supports_staging: bool,
-    pub supports_history: bool,
+    pub capabilities: Capabilities,
     snapshot: RwLock<Snapshot>,
 }
 
@@ -355,14 +468,6 @@ impl Client {
             protocol_version: String,
             capabilities: Capabilities,
         }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Capabilities {
-            read_only: bool,
-            staging: bool,
-            #[serde(default)]
-            history: bool,
-        }
         let initialized: Initialization = transport
             .request(
                 "initialize",
@@ -376,6 +481,20 @@ impl Client {
         ensure!(
             initialized.capabilities.read_only,
             "provider must support read-only operation"
+        );
+        let capabilities = initialized.capabilities;
+        ensure!(
+            !capabilities.tracking || capabilities.branches,
+            "tracking requires branches capability"
+        );
+        ensure!(
+            !(capabilities.blame
+                || capabilities.branch_diff
+                || capabilities.permalinks
+                || capabilities.diff_stats
+                || capabilities.stashes
+                || capabilities.worktrees),
+            "provider advertises features not implemented by protocol 0.1"
         );
         let repository: Option<RepositoryInfo> = transport
             .request("repository/discover", json!({"workspaceRoot":root}))
@@ -393,11 +512,11 @@ impl Client {
             .request("repository/status", json!({"repository":repository.id}))
             .await?;
         snapshot.validate()?;
+        snapshot.validate_capabilities(capabilities)?;
         Ok(Self {
             transport: std::sync::Arc::new(Mutex::new(Connection::Process(transport))),
             repository,
-            supports_staging: initialized.capabilities.staging,
-            supports_history: initialized.capabilities.history,
+            capabilities: initialized.capabilities,
             snapshot: RwLock::new(snapshot),
         })
     }
@@ -411,8 +530,11 @@ impl Client {
         snapshot.validate()?;
         Ok(Self {
             repository,
-            supports_staging: true,
-            supports_history: false,
+            capabilities: Capabilities {
+                read_only: true,
+                staging: true,
+                ..Default::default()
+            },
             snapshot: RwLock::new(snapshot),
             transport: std::sync::Arc::new(Mutex::new(Connection::Mock(Box::new(handler)))),
         })
@@ -454,6 +576,7 @@ impl Client {
             )
             .await?;
         snapshot.validate()?;
+        snapshot.validate_capabilities(self.capabilities)?;
         *self.snapshot.write() = snapshot;
         Ok(())
     }
@@ -465,7 +588,7 @@ impl Client {
         limit: usize,
     ) -> Result<History> {
         ensure!(
-            self.supports_history,
+            self.capabilities.history,
             "VCS provider does not support history"
         );
         validate_revision(revision)?;
@@ -494,7 +617,7 @@ impl Client {
 
     pub async fn commit_details(&self, revision: &str) -> Result<HistoryCommit> {
         ensure!(
-            self.supports_history,
+            self.capabilities.history,
             "VCS provider does not support history"
         );
         validate_revision(revision)?;
@@ -514,7 +637,7 @@ impl Client {
 
     pub async fn commit_changes(&self, revision: &str) -> Result<Vec<CommitChange>> {
         ensure!(
-            self.supports_history,
+            self.capabilities.history,
             "VCS provider does not support history"
         );
         validate_revision(revision)?;

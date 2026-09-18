@@ -7112,6 +7112,7 @@ dependencies = [
  "askpass",
  "async-channel 2.5.0",
  "async-trait",
+ "bitflags 2.13.1",
  "collections",
  "derive_more",
  "futures 0.3.32",

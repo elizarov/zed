@@ -3685,6 +3685,25 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
         );
         repository
     });
+    repository.read_with(cx, |repo, _| {
+        use git::repository::{RepositoryCapabilities as C, UpstreamTracking};
+        assert!(repo.supports(C::HISTORY | C::BRANCHES | C::TAGS | C::TRACKING));
+        assert!(!repo.supports(C::BLAME));
+        assert_eq!(repo.branch_list.len(), 4);
+        assert!(repo.branch_list.iter().any(|branch| matches!(
+            branch.upstream.as_ref().map(|u| &u.tracking),
+            Some(UpstreamTracking::Unknown)
+        )));
+    });
+    assert!(
+        repository
+            .update(cx, |repo, _| repo.default_branch(false))
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("does not support")
+    );
     let buffer = project
         .update(cx, |project, cx| {
             project.open_buffer((worktree_id, rel_path("hello.txt")), cx)
@@ -3757,6 +3776,13 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
         commits.extend(chunk.unwrap().commits);
     }
     assert_eq!(commits.len(), 2);
+    assert!(
+        commits[0]
+            .ref_names
+            .contains(&"HEAD -> remote-branch".into())
+    );
+    assert!(commits[0].ref_names.contains(&"tag: v1".into()));
+    assert!(commits[1].ref_names.contains(&"origin/main".into()));
     let revision = commits[0].sha.clone();
     assert_eq!(commits[0].parents, [commits[1].sha.clone()]);
     // Opaque provider IDs survive the native Oid-based UI and SSH requests.
@@ -3891,6 +3917,56 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
                 .base_text_string(cx)
                 .unwrap(),
             "index-2\n"
+        );
+    });
+
+    // A tag-only change invalidates the cached client graph, with unchanged
+    // branch tips, HEAD and working file status.
+    use git::repository::{LogOrder, LogSource};
+    repository.update(cx, |repo, cx| {
+        repo.graph_data(LogSource::All, LogOrder::DateOrder, 0..200, cx);
+    });
+    repository
+        .condition::<project::git_store::RepositoryEvent>(cx, |repo, _| {
+            repo.get_graph_data(LogSource::All, LogOrder::DateOrder)
+                .is_some_and(|data| !data.commit_data.is_empty())
+        })
+        .await;
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&smol::fs::read(&state_path).await.unwrap()).unwrap();
+    state["snapshot"] = "refs-only".into();
+    state["tagRevision"] = "revision-1".into();
+    smol::fs::write(&state_path, state.to_string())
+        .await
+        .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(60));
+    repository
+        .condition::<project::git_store::RepositoryEvent>(cx, |repo, _| {
+            repo.references_version.as_deref() == Some("refs-only")
+        })
+        .await;
+    repository.update(cx, |repo, cx| {
+        repo.graph_data(LogSource::All, LogOrder::DateOrder, 0..200, cx);
+    });
+    repository
+        .condition::<project::git_store::RepositoryEvent>(cx, |repo, _| {
+            repo.get_graph_data(LogSource::All, LogOrder::DateOrder)
+                .is_some_and(|data| data.commit_data.len() == 2)
+        })
+        .await;
+    repository.update(cx, |repo, cx| {
+        let response = repo.graph_data(LogSource::All, LogOrder::DateOrder, 0..200, cx);
+        assert!(
+            !response.commits[0]
+                .ref_names
+                .iter()
+                .any(|name| name == "tag: v1")
+        );
+        assert!(
+            response.commits[1]
+                .ref_names
+                .iter()
+                .any(|name| name == "tag: v1")
         );
     });
 

@@ -371,6 +371,7 @@ impl Repository {
             PathStyle::local(),
         );
         snapshot.is_read_only = true;
+        snapshot.capabilities = backend.capabilities();
         let state = LocalRepositoryState {
             backend: backend.clone(),
             fs,
@@ -403,6 +404,7 @@ impl Repository {
         repository.schedule_scan(updates_tx, cx);
         repository._provider_task = cx.spawn(async move |this, cx| {
             let mut previous_snapshot = backend.client.snapshot().snapshot;
+            let mut previous_references = backend.client.snapshot().references;
             let mut previous_error = None;
             loop {
                 cx.background_executor().timer(interval).await;
@@ -411,7 +413,10 @@ impl Repository {
                 }
                 let result = backend.refresh().await;
                 let error = result.as_ref().err().map(ToString::to_string);
-                let snapshot = backend.client.snapshot().snapshot;
+                let current = backend.client.snapshot();
+                let references_changed = current.references != previous_references;
+                previous_references = current.references;
+                let snapshot = current.snapshot;
                 if snapshot != previous_snapshot || error != previous_error {
                     if let Some(error) = &error {
                         log::error!("VCS provider: {error}");
@@ -428,6 +433,11 @@ impl Repository {
                                         _ => None,
                                     }
                                 });
+                            if references_changed {
+                                this.snapshot.references_version = Some(snapshot.clone());
+                                this.initial_graph_data.clear();
+                                cx.emit(RepositoryEvent::BranchListChanged);
+                            }
                             this.schedule_scan(updates_tx, cx);
                             if result.is_ok() {
                                 this.reload_buffer_diff_bases(cx);
@@ -444,6 +454,10 @@ impl Repository {
         });
         cx.subscribe_self(Self::handle_subscribe_self).detach();
         repository
+    }
+
+    pub fn supports(&self, feature: git::repository::RepositoryCapabilities) -> bool {
+        self.snapshot.capabilities.contains(feature)
     }
 
     pub fn is_read_only(&self) -> bool {

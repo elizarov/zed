@@ -141,6 +141,33 @@ fail initialization. `readOnly: true` is mandatory and means the session exposes
 no VCS mutations. `staging` advertises a separate staging baseline, **not** permission
 to stage. It must be present and boolean.
 
+## Feature Capabilities {#feature-capabilities}
+
+Capabilities are fixed for the process lifetime. `readOnly` and `staging` are
+required; every optional flag defaults to false. They describe readable features,
+independently of permission to mutate a repository. Status, comparisons and
+content reads are mandatory. Unknown fields are ignored for forward compatibility.
+
+| Flag                                | Meaning when true                                        |
+| ----------------------------------- | -------------------------------------------------------- |
+| `history`                           | History, commit metadata and commit diffs                |
+| `branches`                          | Complete local and cached remote branch references       |
+| `tags`                              | Complete known tag references                            |
+| `tracking`                          | Upstream metadata on local branches; requires `branches` |
+| `blame`, `branchDiff`, `permalinks` | Reserved; must be false in version 0.1                   |
+| `diffStats`, `stashes`, `worktrees` | Reserved; must be false in version 0.1                   |
+
+Advertising a reserved feature is an initialization error; there are no methods
+for it yet. Unsupported reads are rejected or skipped before scheduling work,
+and history and branch controls use the same capabilities. Native Git retains
+its existing features. Read-only branch selection opens history, never checkout.
+
+The internal SSH `UpdateRepository.capabilities` optional bitmask preserves these
+features (staging through worktrees, in the order above with staging first).
+Missing masks retain legacy behavior: native Git has all features, old read-only
+peers have staging baselines and history. Unknown bits are ignored. This is an
+internal transport detail, not part of the provider JSON protocol.
+
 Zed serializes requests per process. A complete JSON-RPC error leaves the connection
 usable. EOF, a malformed frame, an unexpected response ID, or a request timeout
 terminates the connection. Timeouts kill and reap the process because a partially
@@ -204,7 +231,7 @@ scoped status snapshot:
 `snapshot` is a nonempty opaque token. It identifies coherent repository metadata
 and immutable base/staging content, not a frozen working directory. Reuse it only
 while that metadata and those baselines remain identical. Change it when the
-revision, branch, status list, or staged content changes, including restaging a
+revision, branch, references, status list, or staged content changes, including restaging a
 file whose status label remains unchanged. Working file bytes come from Zed's live
 buffers/filesystem and are refreshed through its normal file watching.
 
@@ -246,6 +273,63 @@ A status error must not be turned into an empty success. Zed retains its last
 valid snapshot, reports refresh failures in the log and repository error state,
 and retries at the next poll. Snapshot updates should be inexpensive: listing
 status must not materialize the content of every tracked file.
+
+## Branches, Tags and Tracking {#branches-tags-and-tracking}
+
+When enabled, `repository/status` includes a complete `references` array. It
+covers repository-wide refs even when working status and history are scoped to a
+subdirectory. Missing references default to an empty list for older providers.
+
+```json
+{
+  "references": [
+    {
+      "kind": "branch",
+      "name": "main",
+      "revision": "change-42",
+      "commit": {
+        "timestamp": 1700000000,
+        "subject": "Update service",
+        "authorName": "Example"
+      },
+      "upstream": {
+        "name": "origin/main",
+        "gone": false,
+        "ahead": 2,
+        "behind": 0
+      }
+    },
+    { "kind": "remoteBranch", "name": "origin/main", "revision": "change-40" },
+    { "kind": "tag", "name": "v1.0", "revision": "change-40" }
+  ]
+}
+```
+
+`kind` is `branch`, `remoteBranch` or `tag`; each requires the corresponding
+capability. Names are display names without Git's `refs/heads/`, `refs/remotes/`
+or `refs/tags/` prefixes. They must be nonempty, at most 4096 bytes, and contain no
+control characters. `(kind, name)` must be unique. A branch and tag may share a
+name. `revision` is an immutable opaque ID, subject to the history ID rules.
+`commit` is optional tip metadata for the branch picker, with Unix timestamp,
+subject and author name. HEAD comes from the snapshot's `branch` and `revision`;
+a null branch denotes detached HEAD.
+
+Only local branches may have `upstream`, and only with `tracking: true`.
+Its name identifies the remote branch. `gone` defaults to false. `ahead` and
+`behind` are either both nonnegative 32-bit integers or both null/omitted.
+Missing counts mean unknown, not zero; `gone: true` forbids counts. Providers
+must not fetch or upload refs just to fill this metadata.
+
+Ref additions, removals, moves and tracking changes must change the snapshot
+token even if HEAD and file status are unchanged. Zed invalidates history on
+these changes; `UpdateRepository.references_version` carries the invalidation
+over SSH, while branch metadata travels in the existing branch-list fields.
+`GitUpstream.tracking_unknown` distinguishes unavailable counts from a gone ref.
+
+Zed decorates loaded commits with all matching HEAD, branch and tag names. Branch
+selection resolves the snapshot's immutable tip before requesting history. The
+current adapter loads one bounded history window at a time, starting at HEAD or
+the selected reference; a combined graph of all branch tips is not implemented.
 
 ## Comparisons and Content {#comparisons-and-content}
 
@@ -382,8 +466,7 @@ it is not treated as binary or empty historical content. The internal SSH
 `CommitFile.omitted_reason` field carries that reason to the editor. No VCS
 writes are enabled. The internal Git adapter preserves full hexadecimal IDs and
 maps other IDs to stable synthetic Oids for the existing UI; the external protocol
-never requires Git hashes. File-history suggestions and arbitrary branch browsing
-remain outside this prototype.
+never requires Git hashes. File-history suggestions remain outside this prototype.
 
 ## Refresh Notifications {#refresh-notifications}
 
@@ -453,8 +536,8 @@ cargo test -p remote_server --lib test_remote_external_provider
 
 The protocol suite uses a real mock process and covers framing, initialization,
 status, notifications, lazy binary content, expired snapshots, provider errors,
-and timeouts. The
-project tests use an in-memory mock for native tree status, live baseline refresh,
+timeouts, capability validation and reference metadata. Tag-only refresh and
+tracking states are tested across the SSH transport. The project tests use an in-memory mock for native tree status, live baseline refresh,
 and blocked writes, plus a mock process for settings, trust revocation, and restart
 behavior. The remote test runs a mock provider behind a headless server and the
 real Zed RPC layer, checking settings isolation, status and baseline refresh,
