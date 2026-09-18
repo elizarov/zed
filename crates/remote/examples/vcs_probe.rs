@@ -231,7 +231,13 @@ fn main() -> Result<()> {
                     _ => bail!("unexpected history response"),
                 }
             }
-            let first = commits.first().context("history is empty")?;
+            let first = match std::env::var("ZED_VCS_PROBE_COMMIT") {
+                Ok(revision) => commits
+                    .iter()
+                    .find(|commit| commit.sha == revision)
+                    .context("requested commit is not in history")?,
+                Err(_) => commits.first().context("history is empty")?,
+            };
             let data = probe
                 .request(proto::GetCommitData {
                     project_id,
@@ -258,7 +264,36 @@ fn main() -> Result<()> {
                     !diff.files.is_empty(),
                     "choose a history with a nonempty first commit"
                 );
-                println!("Remote historical diff: {} files", diff.files.len());
+                let omitted = diff
+                    .files
+                    .iter()
+                    .filter(|file| file.omitted_reason.is_some())
+                    .count();
+                println!(
+                    "Remote historical diff: {} files, {} omitted",
+                    diff.files.len(),
+                    omitted
+                );
+                if let Ok(path) = std::env::var("ZED_VCS_PROBE_EXPECT_OMITTED") {
+                    let file = diff
+                        .files
+                        .iter()
+                        .find(|file| file.path == path)
+                        .context("missing omitted file")?;
+                    ensure!(
+                        file.omitted_reason.is_some(),
+                        "expected a size-limit omission"
+                    );
+                    ensure!(
+                        !file.is_binary,
+                        "oversized text must not be mislabeled as binary"
+                    );
+                    ensure!(
+                        diff.files.iter().any(|file| file.omitted_reason.is_none()
+                            && file.new_text.as_ref().is_some_and(|text| !text.is_empty())),
+                        "missing ordinary file contents"
+                    );
+                }
             }
         }
         probe

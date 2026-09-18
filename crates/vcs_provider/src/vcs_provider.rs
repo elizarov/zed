@@ -290,6 +290,12 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
+pub fn is_size_limit_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ProviderError>()
+        .is_some_and(|error| error.code == -32002)
+}
+
 #[cfg(feature = "test-support")]
 type MockRequestHandler = dyn FnMut(&str, Value) -> Result<Value> + Send;
 

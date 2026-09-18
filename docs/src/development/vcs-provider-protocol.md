@@ -373,7 +373,13 @@ expired history read is surfaced without substituting current file content.
 
 Zed uses its native History tab, commit details, and commit diff viewer locally
 and over SSH. It loads up to 200 recent commits and searches within that window.
-Commit diff loading is bounded to 128 MiB of total before/after content. No VCS
+The commit tab opens immediately, shows loading and file-preparation progress,
+and presents failures with a retry button. A `-32002` error from `readContent`
+omits only that file's diff; other errors still fail the load. Files exceeding
+the 128 MiB total before/after content budget are also omitted. Each omitted
+entry keeps its path and added/modified/deleted status, with a visible reason;
+it is not treated as binary or empty historical content. The internal SSH
+`CommitFile.omitted_reason` field carries that reason to the editor. No VCS
 writes are enabled. The internal Git adapter preserves full hexadecimal IDs and
 maps other IDs to stable synthetic Oids for the existing UI; the external protocol
 never requires Git hashes. File-history suggestions and arbitrary branch browsing
