@@ -43,6 +43,36 @@ fn main() -> Result<()> {
         let start = Instant::now();
         client.refresh().await?;
         println!("Status refreshed in {:?}", start.elapsed());
+        if client.supports_history {
+            let revision = client
+                .snapshot()
+                .revision
+                .context("missing current revision")?;
+            let history = client.history(&revision, None, 5).await?;
+            println!(
+                "History: {} commits; older commits: {}",
+                history.commits.len(),
+                history.has_more
+            );
+            if let Some(commit) = history.commits.first() {
+                let details = client.commit_details(&commit.id).await?;
+                let changes = client.commit_changes(&commit.id).await?;
+                println!(
+                    "Newest scoped commit: {} message bytes, {} changed files",
+                    details.message.len(),
+                    changes.len()
+                );
+                if let Some(change) = changes.first() {
+                    for reference in [&change.base, &change.target].into_iter().flatten() {
+                        println!(
+                            "Historical content bytes: {}",
+                            client.read_content(reference).await?.len()
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(())
     })
 }

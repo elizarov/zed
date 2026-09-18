@@ -116,3 +116,51 @@ fn expired_snapshot_is_refreshed_and_retried_once() {
         assert_eq!(client.snapshot().snapshot, "2");
     });
 }
+
+#[test]
+fn optional_history_metadata_and_commit_contents() {
+    smol::block_on(async {
+        let client = start("history", Duration::from_secs(3)).await.unwrap();
+        assert!(client.supports_history);
+        let history = client.history("revision-2", None, 1).await.unwrap();
+        assert_eq!(history.commits.len(), 1);
+        assert!(history.has_more);
+        assert_eq!(history.commits[0].parents, ["revision-1"]);
+        let commit = client.commit_details("revision-2").await.unwrap();
+        assert_eq!(commit.message, "Change hello\n\nDetails");
+        let changes = client.commit_changes("revision-2").await.unwrap();
+        assert_eq!(changes.len(), 3);
+        assert!(changes[1].base.is_none());
+        assert!(changes[2].target.is_none());
+        assert_eq!(
+            client
+                .read_content(changes[0].base.as_ref().unwrap())
+                .await
+                .unwrap(),
+            b"before\n\x00\xff"
+        );
+        assert!(
+            client
+                .history("revision-2", Some("../escape"), 1)
+                .await
+                .is_err()
+        );
+        assert!(client.history("revision-2", None, 201).await.is_err());
+        let old_provider = start("normal", Duration::from_secs(3)).await.unwrap();
+        assert!(!old_provider.supports_history);
+        assert!(
+            old_provider
+                .history("opaque-revision", None, 1)
+                .await
+                .is_err()
+        );
+        for (mode, limit) in [("history-bad-id", 2), ("history-too-many", 1)] {
+            let client = start(mode, Duration::from_secs(3)).await.unwrap();
+            assert!(client.history("revision-2", None, limit).await.is_err());
+        }
+        let client = start("history-bad-path", Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(client.commit_changes("revision-2").await.is_err());
+    });
+}

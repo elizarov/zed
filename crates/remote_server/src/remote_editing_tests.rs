@@ -3659,6 +3659,60 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
         buffer.edit([(0..0, "unsaved\n")], None, cx)
     });
     let repository_id = repository.read_with(cx, |repo, _| repo.id.to_proto());
+    let mut history_stream = client
+        .request_stream(proto::GetInitialGraphData {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            repository_id,
+            log_source: Some(proto::GitLogSource {
+                source: Some(proto::git_log_source::Source::Branch(
+                    "remote-branch".into(),
+                )),
+            }),
+            log_order: proto::get_initial_graph_data::LogOrder::DateOrder as i32,
+        })
+        .await
+        .unwrap();
+    let mut commits = Vec::new();
+    while let Some(chunk) = history_stream.next().await {
+        commits.extend(chunk.unwrap().commits);
+    }
+    assert_eq!(commits.len(), 2);
+    let revision = commits[0].sha.clone();
+    assert_eq!(commits[0].parents, [commits[1].sha.clone()]);
+    // Opaque provider IDs survive the native Oid-based UI and SSH requests.
+    let metadata = client
+        .request(proto::GetCommitData {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            repository_id,
+            shas: vec![revision.clone()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(metadata.commits.len(), 1);
+    assert_eq!(metadata.commits[0].subject, "Change hello");
+    let details = repository
+        .update(cx, |repo, _| repo.show(revision.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(details.message.as_ref(), "Change hello\n\nDetails");
+    let historical_diff = repository
+        .update(cx, |repo, _| repo.load_commit_diff(revision, false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(historical_diff.files.len(), 3);
+    assert_eq!(
+        historical_diff.files[0].old_text.as_deref(),
+        Some("before\n")
+    );
+    assert_eq!(
+        historical_diff.files[0].new_text.as_deref(),
+        Some("after\n")
+    );
+    assert!(historical_diff.files[1].old_text.is_none());
+    assert!(historical_diff.files[2].new_text.is_none());
+
     assert!(
         client
             .request(proto::Stage {

@@ -140,21 +140,39 @@ struct CommitDataRequest {
     response_tx: oneshot::Sender<Result<CommitData>>,
 }
 
-pub struct CommitDataReader {
-    request_tx: async_channel::Sender<CommitDataRequest>,
-    _task: Task<()>,
+pub struct CommitDataReader(CommitDataReaderSource);
+
+enum CommitDataReaderSource {
+    Process {
+        request_tx: async_channel::Sender<CommitDataRequest>,
+        _task: Task<()>,
+    },
+    Cached(Arc<Mutex<HashMap<Oid, CommitData>>>),
 }
 
 impl CommitDataReader {
     pub async fn read(&self, sha: Oid) -> Result<CommitData> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.request_tx
-            .send(CommitDataRequest { sha, response_tx })
-            .await
-            .map_err(|_| anyhow!("commit data reader task closed"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow!("commit data reader task dropped response"))?
+        match &self.0 {
+            CommitDataReaderSource::Cached(cached) => cached
+                .lock()
+                .get(&sha)
+                .cloned()
+                .context("commit is outside the loaded provider history"),
+            CommitDataReaderSource::Process { request_tx, .. } => {
+                let (response_tx, response_rx) = oneshot::channel();
+                request_tx
+                    .send(CommitDataRequest { sha, response_tx })
+                    .await
+                    .map_err(|_| anyhow!("commit data reader task closed"))?;
+                response_rx
+                    .await
+                    .map_err(|_| anyhow!("commit data reader task dropped response"))?
+            }
+        }
+    }
+
+    fn from_cache(cached: Arc<Mutex<HashMap<Oid, CommitData>>>) -> Self {
+        Self(CommitDataReaderSource::Cached(cached))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -172,10 +190,10 @@ impl CommitDataReader {
             }
         });
 
-        Self {
+        Self(CommitDataReaderSource::Process {
             request_tx,
             _task: task,
-        }
+        })
     }
 }
 
@@ -3585,10 +3603,10 @@ impl GitRepository for RealGitRepository {
             }
         });
 
-        Ok(CommitDataReader {
+        Ok(CommitDataReader(CommitDataReaderSource::Process {
             request_tx,
             _task: task,
-        })
+        }))
     }
 
     fn set_trusted(&self, trusted: bool) {
