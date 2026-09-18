@@ -614,7 +614,7 @@ mod tests {
             store.register_external_repository(
                 worktree_id,
                 backend.clone(),
-                fs,
+                fs.clone(),
                 Duration::from_secs(60),
                 cx,
             )
@@ -642,6 +642,22 @@ mod tests {
             assert!(repository.read(cx).is_read_only());
             assert!(repository.read(cx).is_trusted());
             repository
+        });
+        fs.insert_tree(root, json!({"scanned.txt": "new file\n"}))
+            .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        repository.read_with(cx, |repository, _| {
+            let jobs = repository.job_debug_queue().to_debug_value();
+            assert!(
+                !jobs["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|job| job["description"] == "paths_changed")
+            );
         });
         let buffer = project
             .update(cx, |project, cx| {

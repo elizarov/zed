@@ -201,6 +201,29 @@ fn main() -> Result<()> {
                 .keys()
                 .next()
                 .context("missing repository")?;
+            let editor_error = probe
+                .request(proto::OpenCommitMessageBuffer {
+                    project_id,
+                    repository_id,
+                })
+                .await
+                .err()
+                .context("read-only repositories must not create a commit editor")?;
+            ensure!(
+                editor_error.to_string().contains("read-only"),
+                "{editor_error:#}"
+            );
+            let template = probe
+                .request(proto::LoadCommitTemplate {
+                    project_id,
+                    repository_id,
+                })
+                .await?;
+            ensure!(
+                template.template.is_none(),
+                "read-only repository has a commit template"
+            );
+            println!("Read-only commit editor disabled; template request completed");
             let request_id = probe
                 .send(
                     proto::GetInitialGraphData {
