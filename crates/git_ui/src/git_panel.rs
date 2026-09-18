@@ -6960,14 +6960,54 @@ impl GitPanel {
             ))
     }
 
-    fn repository_discovery_message(&self, cx: &App) -> Option<&'static str> {
-        let store = self.project.read(cx).git_store().read(cx);
+    fn render_repository_discovery(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let git_store = self.project.read(cx).git_store().clone();
+        let store = git_store.read(cx);
         if self.active_repository.is_none() && store.active_repository().is_some() {
-            return Some("Loading repository…");
+            return Some(
+                Self::render_history_placeholder("Loading repository…").into_any_element(),
+            );
         }
         match store.repository_discovery_state() {
-            Some(RepositoryDiscoveryState::Loading) => Some("Loading repository…"),
-            Some(RepositoryDiscoveryState::Failed(_)) => Some("Failed to load repository"),
+            Some(RepositoryDiscoveryState::Loading) => {
+                Some(Self::render_history_placeholder("Loading repository…").into_any_element())
+            }
+            Some(RepositoryDiscoveryState::Failed(error)) => {
+                let error = error.clone();
+                Some(
+                    v_flex()
+                        .w_full()
+                        .p_3()
+                        .gap_2()
+                        .items_center()
+                        .child(Label::new("Failed to load repository").color(Color::Muted))
+                        .child(
+                            div()
+                                .id("repository-discovery-error")
+                                .w_full()
+                                .child(
+                                    Label::new(error.clone())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .line_clamp(4),
+                                )
+                                .tooltip(Tooltip::text(error)),
+                        )
+                        .child(
+                            Button::new("retry_repository_discovery", "Retry")
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Outlined)
+                                .on_click(move |_, _, cx| {
+                                    git_store
+                                        .update(cx, |store, cx| {
+                                            store.retry_repository_discovery(cx)
+                                        })
+                                        .detach_and_log_err(cx);
+                                }),
+                        )
+                        .into_any_element(),
+                )
+            }
             None => None,
         }
     }
@@ -6976,10 +7016,11 @@ impl GitPanel {
         v_flex().flex_1().size_full().overflow_hidden().map(|this| {
             let has_repo = self.active_repository.is_some();
             match &self.commit_history {
-                _ if !has_repo => this.child(Self::render_history_placeholder(
-                    self.repository_discovery_message(cx)
-                        .unwrap_or("No repository found"),
-                )),
+                _ if !has_repo => {
+                    this.child(self.render_repository_discovery(cx).unwrap_or_else(|| {
+                        Self::render_history_placeholder("No repository found").into_any_element()
+                    }))
+                }
                 CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
                     "Failed to load commit history",
                 )),
@@ -7651,8 +7692,8 @@ impl GitPanel {
     }
 
     fn render_uninitialized_ui(&self, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(message) = self.repository_discovery_message(cx) {
-            return Self::render_history_placeholder(message).into_any_element();
+        if let Some(discovery) = self.render_repository_discovery(cx) {
+            return discovery;
         }
         let worktree_count = self.project.read(cx).visible_worktrees(cx).count();
         if worktree_count > 0 && self.active_repository.is_none() {

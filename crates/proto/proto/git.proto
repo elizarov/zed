@@ -149,6 +149,10 @@ message UpdateRepository {
   bool is_read_only = 22;
 }
 
+message RetryRepositoryDiscovery {
+  uint64 project_id = 1;
+}
+
 message UpdateRepositoryDiscovery {
   uint64 project_id = 1;
   uint64 worktree_id = 2;

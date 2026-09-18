@@ -3919,6 +3919,56 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
         store.repository_discovery_state(),
         Some(RepositoryDiscoveryState::Failed(_))
     )));
+    // Retry from the client without recreating the worktree or changing trust.
+    smol::fs::write(&state_path, json!({"pauseStatus": true}).to_string())
+        .await
+        .unwrap();
+    store
+        .update(cx, |store, cx| store.retry_repository_discovery(cx))
+        .await
+        .unwrap();
+    store
+        .condition::<GitStoreEvent>(cx, |store, _| {
+            matches!(
+                store.repository_discovery_state(),
+                Some(RepositoryDiscoveryState::Loading)
+            )
+        })
+        .await;
+    assert!(server_store.read_with(server_cx, |store, _| matches!(
+        store.repository_discovery_state(),
+        Some(RepositoryDiscoveryState::Loading)
+    )));
+    // Repeated clicks cannot interrupt a pending launch.
+    store
+        .update(cx, |store, cx| store.retry_repository_discovery(cx))
+        .await
+        .unwrap();
+    let replacement = state_path.with_extension("new");
+    smol::fs::write(
+        &replacement,
+        json!({
+            "snapshot": "retried", "changes": [{"path": "hello.txt", "status": "modified"}]
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    smol::fs::rename(&replacement, &state_path).await.unwrap();
+    store
+        .condition::<GitStoreEvent>(cx, |store, _| {
+            store.active_repository().is_some() && store.repository_discovery_state().is_none()
+        })
+        .await;
+    let repository = store.read_with(cx, |store, _| store.active_repository().unwrap());
+    store
+        .update(cx, |store, cx| store.retry_repository_discovery(cx))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.read_with(cx, |store, _| store.active_repository().unwrap()),
+        repository
+    );
     client
         .request(proto::RestrictWorktrees {
             project_id: proto::REMOTE_SERVER_PROJECT_ID,
@@ -3929,6 +3979,19 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
     store
         .condition::<GitStoreEvent>(cx, |store, _| store.repository_discovery_state().is_none())
         .await;
+    // Retry must not launch a provider after trust has been revoked.
+    store
+        .update(cx, |store, cx| store.retry_repository_discovery(cx))
+        .await
+        .unwrap();
+    server_cx.run_until_parked();
+    cx.run_until_parked();
+    assert!(store.read_with(cx, |store, _| {
+        store.active_repository().is_none() && store.repository_discovery_state().is_none()
+    }));
+    assert!(server_store.read_with(server_cx, |store, _| {
+        store.active_repository().is_none() && store.repository_discovery_state().is_none()
+    }));
     assert!(fs.metadata(&root.join(".git")).await.unwrap().is_none());
     assert_eq!(
         fs.load(&root.join("hello.txt")).await.unwrap(),

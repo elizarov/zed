@@ -519,7 +519,8 @@ message Envelope {
     GetOutgoingCallsResponse get_outgoing_calls_response = 487;
     LspExtExpandAbbreviation lsp_ext_expand_abbreviation = 488;
     LspExtExpandAbbreviationResponse lsp_ext_expand_abbreviation_response = 489;
-    UpdateRepositoryDiscovery update_repository_discovery = 490; // current max
+    UpdateRepositoryDiscovery update_repository_discovery = 490;
+    RetryRepositoryDiscovery retry_repository_discovery = 491; // current max
   }
 
   reserved 87 to 88;

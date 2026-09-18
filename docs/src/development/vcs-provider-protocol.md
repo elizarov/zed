@@ -37,8 +37,11 @@ paths; shell expansions, including `~`, do not apply. Polling defaults to 2000 m
 
 The setting selects one external provider per opened worktree on the host, including
 when the worktree is a subdirectory of a larger repository. It supersedes native
-Git discovery in that worktree. Restart the project after configuration changes
-or a failed process launch. Startup errors are recorded in Zed's log.
+Git discovery in that worktree. After a failed launch, the panel shows the error
+and a **Retry** button. Retry uses the current provider settings and restarts only
+failed providers, leaving active repositories and pending launches alone. Restart
+the project to change the configuration of an already running provider. Startup
+errors are also recorded in Zed's log.
 
 An untrusted worktree cannot launch a provider. Restricting or closing a worktree
 stops its provider and removes the repository from connected SSH clients.
@@ -57,7 +60,10 @@ Ordinary file editing remains available. A per-worktree
 repository exists. Both panel tabs show “Loading repository…” until the initial
 status snapshot arrives; failed startup shows “Failed to load repository”. Trust
 revocation and worktree removal clear this state. It is synchronized when the
-project is reshared, and is not forwarded to collaboration guests.
+project is reshared, and is not forwarded to collaboration guests. The internal
+`RetryRepositoryDiscovery { project_id }` request asks the SSH host to retry failed
+providers and acknowledges once startup is scheduled. Normal discovery updates
+report the result; retry never bypasses workspace trust.
 
 Configure `vcs_provider` in the **server settings**, or in a trusted remote
 project's `.zed/settings.json`. Client user settings do not forward this setting,
