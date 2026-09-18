@@ -2,6 +2,87 @@ use super::*;
 use git::repository::ExternalRepository;
 
 impl GitStore {
+    pub fn repository_discovery_state(&self) -> Option<&RepositoryDiscoveryState> {
+        self.external_discovery
+            .values()
+            .find(|state| matches!(state, RepositoryDiscoveryState::Loading))
+            .or_else(|| self.external_discovery.values().next())
+    }
+
+    pub(super) fn discovery_update(
+        project_id: u64,
+        worktree_id: WorktreeId,
+        state: Option<&RepositoryDiscoveryState>,
+    ) -> proto::UpdateRepositoryDiscovery {
+        proto::UpdateRepositoryDiscovery {
+            project_id,
+            worktree_id: worktree_id.to_proto(),
+            loading: matches!(state, Some(RepositoryDiscoveryState::Loading)),
+            error: match state {
+                Some(RepositoryDiscoveryState::Failed(error)) => Some(error.to_string()),
+                _ => None,
+            },
+        }
+    }
+
+    pub(super) fn set_repository_discovery(
+        &mut self,
+        worktree_id: WorktreeId,
+        state: Option<RepositoryDiscoveryState>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.external_discovery.get(&worktree_id) == state.as_ref() {
+            return;
+        }
+        if let Some((client, project_id)) = self.downstream_client() {
+            let update = Self::discovery_update(project_id.to_proto(), worktree_id, state.as_ref());
+            match &self.state {
+                GitStoreState::Local {
+                    downstream: Some(downstream),
+                    ..
+                } => {
+                    // Keep completion behind the initial repository snapshot on the wire.
+                    downstream
+                        .updates_tx
+                        .unbounded_send(DownstreamUpdate::UpdateRepositoryDiscovery(update))
+                        .log_err();
+                }
+                _ if !client.is_via_collab() => {
+                    client.send(update).log_err();
+                }
+                _ => {}
+            }
+        }
+        if let Some(state) = state {
+            self.external_discovery.insert(worktree_id, state);
+        } else {
+            self.external_discovery.remove(&worktree_id);
+        }
+        cx.emit(GitStoreEvent::RepositoryDiscoveryChanged);
+        cx.notify();
+    }
+
+    pub(super) async fn handle_update_repository_discovery(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::UpdateRepositoryDiscovery>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        this.update(&mut cx, |this, cx| {
+            let update = envelope.payload;
+            let worktree_id = WorktreeId::from_proto(update.worktree_id);
+            // Discovery can precede the AddWorktree response that creates the client worktree.
+            let state = if update.loading {
+                Some(RepositoryDiscoveryState::Loading)
+            } else {
+                update
+                    .error
+                    .map(|error| RepositoryDiscoveryState::Failed(error.into()))
+            };
+            this.set_repository_discovery(worktree_id, state, cx);
+        });
+        Ok(())
+    }
+
     pub(super) fn start_external_providers(&mut self, cx: &mut Context<Self>) {
         let GitStoreState::Local { fs, .. } = &self.state else {
             return;
@@ -34,6 +115,7 @@ impl GitStore {
                 continue;
             }
             let fs = fs.clone();
+            self.set_repository_discovery(worktree_id, Some(RepositoryDiscoveryState::Loading), cx);
             let task = cx.spawn(async move |this, cx| {
                 let timeout = Duration::from_millis(
                     configuration
@@ -53,34 +135,61 @@ impl GitStore {
                 .await;
                 match client {
                     Ok(client) => {
+                        let repository = this
+                            .update(cx, |this, cx| {
+                                if this
+                                    .worktree_store
+                                    .read(cx)
+                                    .worktree_for_id(worktree_id, cx)
+                                    .is_none()
+                                {
+                                    return None;
+                                }
+                                let trusted =
+                                    TrustedWorktrees::try_get_global(cx).is_some_and(|trusted| {
+                                        trusted.update(cx, |trusted, cx| {
+                                            trusted.can_trust(&this.worktree_store, worktree_id, cx)
+                                        })
+                                    });
+                                if trusted {
+                                    this.register_external_repository(
+                                        worktree_id,
+                                        Arc::new(ExternalRepository::new(client)),
+                                        fs,
+                                        interval,
+                                        cx,
+                                    )
+                                } else {
+                                    None
+                                }
+                            })
+                            .log_err()
+                            .flatten();
+                        if let Some(repository) = repository {
+                            // Publish the initial snapshot before announcing that discovery finished.
+                            repository
+                                .update(cx, |repository, _| repository.barrier())
+                                .await
+                                .log_err();
+                        }
                         this.update(cx, |this, cx| {
-                            if this
-                                .worktree_store
-                                .read(cx)
-                                .worktree_for_id(worktree_id, cx)
-                                .is_none()
-                            {
-                                return;
-                            }
-                            let trusted =
-                                TrustedWorktrees::try_get_global(cx).is_some_and(|trusted| {
-                                    trusted.update(cx, |trusted, cx| {
-                                        trusted.can_trust(&this.worktree_store, worktree_id, cx)
-                                    })
-                                });
-                            if trusted {
-                                this.register_external_repository(
-                                    worktree_id,
-                                    Arc::new(ExternalRepository::new(client)),
-                                    fs,
-                                    interval,
-                                    cx,
-                                );
-                            }
+                            this.set_repository_discovery(worktree_id, None, cx)
                         })
                         .log_err();
                     }
-                    Err(error) => log::error!("VCS provider for {}: {error:#}", root.display()),
+                    Err(error) => {
+                        log::error!("VCS provider for {}: {error:#}", root.display());
+                        this.update(cx, |this, cx| {
+                            this.set_repository_discovery(
+                                worktree_id,
+                                Some(RepositoryDiscoveryState::Failed(
+                                    format!("{error:#}").into(),
+                                )),
+                                cx,
+                            );
+                        })
+                        .log_err();
+                    }
                 }
             });
             self.external_starts.insert(worktree_id, task);
@@ -94,14 +203,14 @@ impl GitStore {
         fs: Arc<dyn Fs>,
         interval: Duration,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<Entity<Repository>> {
         let GitStoreState::Local {
             next_repository_id,
             downstream,
             ..
         } = &self.state
         else {
-            return;
+            return None;
         };
         let updates_tx = downstream
             .as_ref()
@@ -138,7 +247,7 @@ impl GitStore {
             .push(cx.subscribe(&repository, Self::on_repository_event));
         self._subscriptions
             .push(cx.subscribe(&repository, Self::on_jobs_updated));
-        self.repositories.insert(id, repository);
+        self.repositories.insert(id, repository.clone());
         self.update_diff_operations_for_repository(id, cx);
         self.worktree_ids
             .insert(id, HashSet::from_iter([worktree_id]));
@@ -148,6 +257,7 @@ impl GitStore {
             self.active_repo_id = Some(id);
             cx.emit(GitStoreEvent::ActiveRepositoryChanged(Some(id)));
         }
+        Some(repository)
     }
 
     pub(super) fn update_diff_operations_for_repository(
