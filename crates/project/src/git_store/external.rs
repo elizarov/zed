@@ -9,6 +9,57 @@ impl GitStore {
             .or_else(|| self.external_discovery.values().next())
     }
 
+    pub fn retry_repository_discovery(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if let GitStoreState::Remote {
+            upstream_client,
+            upstream_project_id,
+            ..
+        } = &self.state
+        {
+            if upstream_client.is_via_collab() {
+                return Task::ready(Err(anyhow!(
+                    "provider retry is unavailable in shared projects"
+                )));
+            }
+            let client = upstream_client.clone();
+            let project_id = *upstream_project_id;
+            return cx.background_spawn(async move {
+                client
+                    .request(proto::RetryRepositoryDiscovery { project_id })
+                    .await?;
+                Ok(())
+            });
+        }
+
+        let failed = self
+            .external_discovery
+            .iter()
+            .filter_map(|(id, state)| {
+                matches!(state, RepositoryDiscoveryState::Failed(_)).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for worktree_id in &failed {
+            self.external_starts.remove(worktree_id);
+        }
+        self.start_external_providers(cx);
+        for worktree_id in failed {
+            if !self.external_starts.contains_key(&worktree_id) {
+                self.set_repository_discovery(worktree_id, None, cx);
+            }
+        }
+        Task::ready(Ok(()))
+    }
+
+    pub(super) async fn handle_retry_repository_discovery(
+        this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::RetryRepositoryDiscovery>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        this.update(&mut cx, |this, cx| this.retry_repository_discovery(cx))
+            .await?;
+        Ok(proto::Ack {})
+    }
+
     pub(super) fn discovery_update(
         project_id: u64,
         worktree_id: WorktreeId,
