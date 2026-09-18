@@ -786,6 +786,8 @@ impl Database {
                     } else {
                         updated_repositories.push(proto::UpdateRepository {
                             is_read_only: false,
+                            capabilities: None,
+                            references_version: None,
                             entry_ids,
                             updated_statuses,
                             removed_statuses,

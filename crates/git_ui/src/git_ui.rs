@@ -810,6 +810,10 @@ fn render_remote_button(
     let upstream = branch.upstream.as_ref();
     match upstream {
         Some(Upstream {
+            tracking: UpstreamTracking::Unknown,
+            ..
+        }) => None,
+        Some(Upstream {
             tracking: UpstreamTracking::Tracked(UpstreamTrackingStatus { ahead, behind }),
             ..
         }) => match (*ahead, *behind) {
