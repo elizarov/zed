@@ -85,7 +85,20 @@ while True:
         result = [{"path": "../escape" if mode == "history-bad-path" else "hello.txt", "base": "before", "target": "after"},
                   {"path": "new.txt", "base": None, "target": "after"},
                   {"path": "gone.txt", "base": "before", "target": None}]
+        if mode == "remote":
+            result.extend([
+                {"path": "large-added.c", "base": None, "target": "oversized"},
+                {"path": "large-deleted.c", "base": "oversized", "target": None},
+                {"path": "large-modified.c", "base": "before", "target": "oversized"},
+                {"path": "after-large.txt", "base": None, "target": "after"},
+            ])
     elif method == "repository/readContent":
+        if mode == "remote" and json.loads(Path(sys.argv[2]).read_text()).get("failContent"):
+            send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32000, "message": "mock content failed"}})
+            continue
+        if message["params"]["content"] == "oversized":
+            send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32002, "message": "Content exceeds the file size limit"}})
+            continue
         content = message["params"]["content"].encode() + (b"\n" if mode in {"text", "remote"} else b"\n\x00\xff")
         result = {"encoding": "base64", "data": base64.b64encode(content).decode()}
     else:

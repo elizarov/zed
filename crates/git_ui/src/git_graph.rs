@@ -7676,6 +7676,7 @@ mod tests {
                     old_text: Some("content".into()),
                     new_text: Some("updated content".into()),
                     is_binary: false,
+                    omitted_reason: None,
                 }],
                 is_shallow_boundary: false,
             });

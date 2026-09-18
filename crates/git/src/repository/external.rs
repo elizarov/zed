@@ -437,20 +437,43 @@ impl GitRepository for ExternalRepository {
             let mut files = Vec::with_capacity(changes.len());
             let mut bytes = 0usize;
             for change in changes {
-                let old_content = match change.base {
-                    Some(reference) => Some(self.client.read_content(&reference).await?),
-                    None => None,
+                let contents = async {
+                    let old_content = match change.base.as_deref() {
+                        Some(reference) => Some(self.client.read_content(reference).await?),
+                        None => None,
+                    };
+                    let new_content = match change.target.as_deref() {
+                        Some(reference) => Some(self.client.read_content(reference).await?),
+                        None => None,
+                    };
+                    anyhow::Ok((old_content, new_content))
+                }
+                .await;
+                let (mut old_content, mut new_content, mut omitted_reason) = match contents {
+                    Ok((old_content, new_content)) => (old_content, new_content, None),
+                    Err(error) if vcs_provider::is_size_limit_error(&error) => (
+                        None,
+                        None,
+                        Some("File exceeds the provider's content size limit".to_owned()),
+                    ),
+                    Err(error) => {
+                        return Err(error.context(format!("loading commit file {}", change.path)));
+                    }
                 };
-                let new_content = match change.target {
-                    Some(reference) => Some(self.client.read_content(&reference).await?),
-                    None => None,
-                };
-                bytes += old_content.as_ref().map_or(0, Vec::len)
+                let file_bytes = old_content.as_ref().map_or(0, Vec::len)
                     + new_content.as_ref().map_or(0, Vec::len);
-                anyhow::ensure!(
-                    bytes <= 128 * 1024 * 1024,
-                    "commit diff exceeds the 128 MiB prototype limit; open a narrower workspace"
-                );
+                if bytes + file_bytes > 128 * 1024 * 1024 {
+                    omitted_reason =
+                        Some("Commit diff exceeds the 128 MiB content limit".to_owned());
+                }
+                if omitted_reason.is_some() {
+                    // Preserve side presence for added/deleted status without pretending
+                    // the placeholder is the file's historical content.
+                    old_content = change.base.as_ref().map(|_| Vec::new());
+                    new_content = change.target.as_ref().map(|_| Vec::new());
+                } else {
+                    bytes += file_bytes;
+                }
                 let is_binary = old_content
                     .as_ref()
                     .is_some_and(|value| is_binary_content(value))
@@ -462,6 +485,7 @@ impl GitRepository for ExternalRepository {
                     old_content,
                     new_content,
                     is_binary,
+                    omitted_reason,
                 });
             }
             Ok(CommitDiff {

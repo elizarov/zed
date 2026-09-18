@@ -572,6 +572,7 @@ pub struct CommitFile {
     pub old_content: Option<Vec<u8>>,
     pub new_content: Option<Vec<u8>>,
     pub is_binary: bool,
+    pub omitted_reason: Option<String>,
 }
 
 impl CommitFile {
@@ -1574,6 +1575,7 @@ impl GitRepository for RealGitRepository {
                     old_content,
                     new_content,
                     is_binary,
+                    omitted_reason: None,
                 })
             }
 
