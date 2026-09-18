@@ -323,6 +323,7 @@ message CommitFile {
   optional string old_text = 2;
   optional string new_text = 3;
   bool is_binary = 4;
+  optional string omitted_reason = 5;
 }
 
 message GitReset {

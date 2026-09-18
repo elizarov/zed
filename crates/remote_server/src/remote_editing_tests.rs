@@ -3755,11 +3755,11 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
         .unwrap();
     assert_eq!(details.message.as_ref(), "Change hello\n\nDetails");
     let historical_diff = repository
-        .update(cx, |repo, _| repo.load_commit_diff(revision, false))
+        .update(cx, |repo, _| repo.load_commit_diff(revision.clone(), false))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(historical_diff.files.len(), 3);
+    assert_eq!(historical_diff.files.len(), 7);
     assert_eq!(
         historical_diff.files[0].old_text.as_deref(),
         Some("before\n")
@@ -3770,6 +3770,38 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
     );
     assert!(historical_diff.files[1].old_text.is_none());
     assert!(historical_diff.files[2].new_text.is_none());
+    for (index, expected_status) in [
+        (3, git::repository::CommitFileStatus::Added),
+        (4, git::repository::CommitFileStatus::Deleted),
+        (5, git::repository::CommitFileStatus::Modified),
+    ] {
+        let file = &historical_diff.files[index];
+        assert_eq!(file.status(), expected_status);
+        assert!(
+            file.omitted_reason
+                .as_deref()
+                .unwrap()
+                .contains("size limit")
+        );
+        assert!(!file.is_binary);
+    }
+    assert_eq!(
+        historical_diff.files[6].new_text.as_deref(),
+        Some("after\n")
+    );
+    assert!(historical_diff.files[6].omitted_reason.is_none());
+    // Ordinary provider failures must still fail visibly, rather than omit files.
+    let previous = smol::fs::read(&state_path).await.unwrap();
+    smol::fs::write(&state_path, json!({"failContent": true}).to_string())
+        .await
+        .unwrap();
+    let error = repository
+        .update(cx, |repo, _| repo.load_commit_diff(revision, false))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("mock content failed"));
+    smol::fs::write(&state_path, previous).await.unwrap();
 
     assert!(
         client

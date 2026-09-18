@@ -666,6 +666,7 @@ fn open_buffer_blame_at_revision(
                     worktree_id,
                     is_deleted: false,
                     is_binary: false,
+                    is_omitted: false,
                     display_name: display_name.clone(),
                 }) as Arc<dyn language::File>;
 
