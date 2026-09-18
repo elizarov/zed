@@ -176,6 +176,72 @@ fn main() -> Result<()> {
             diff.committed_text.is_some(),
             "choose a tracked text file with a committed baseline"
         );
+        if let Ok(history_mode) = std::env::var("ZED_VCS_PROBE_HISTORY") {
+            let repository_id = *probe
+                .repositories
+                .keys()
+                .next()
+                .context("missing repository")?;
+            let request_id = probe
+                .send(
+                    proto::GetInitialGraphData {
+                        project_id,
+                        repository_id,
+                        log_source: Some(proto::GitLogSource {
+                            source: Some(proto::git_log_source::Source::All(
+                                proto::GitLogSourceAll {},
+                            )),
+                        }),
+                        log_order: proto::get_initial_graph_data::LogOrder::DateOrder as i32,
+                    }
+                    .into_envelope(0, None, None),
+                )
+                .await?;
+            let mut commits = Vec::new();
+            loop {
+                let message = probe.receive().await?;
+                if message.responding_to != Some(request_id) {
+                    continue;
+                }
+                match message.payload {
+                    Some(Payload::GetInitialGraphDataResponse(response)) => {
+                        commits.extend(response.commits)
+                    }
+                    Some(Payload::EndStream(_)) => break,
+                    Some(Payload::Error(error)) => bail!("history: {}", error.message),
+                    _ => bail!("unexpected history response"),
+                }
+            }
+            let first = commits.first().context("history is empty")?;
+            let data = probe
+                .request(proto::GetCommitData {
+                    project_id,
+                    repository_id,
+                    shas: vec![first.sha.clone()],
+                })
+                .await?;
+            ensure!(data.commits.len() == 1, "missing history metadata");
+            println!(
+                "Remote history: {} commits; first message has {} bytes",
+                commits.len(),
+                data.commits[0].message.len()
+            );
+            if history_mode == "diff" {
+                let diff = probe
+                    .request(proto::LoadCommitDiff {
+                        project_id,
+                        repository_id,
+                        commit: first.sha.clone(),
+                        ignore_shallow_boundary: false,
+                    })
+                    .await?;
+                ensure!(
+                    !diff.files.is_empty(),
+                    "choose a history with a nonempty first commit"
+                );
+                println!("Remote historical diff: {} files", diff.files.len());
+            }
+        }
         probe
             .request(proto::RestrictWorktrees {
                 project_id,

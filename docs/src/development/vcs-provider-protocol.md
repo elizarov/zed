@@ -294,6 +294,80 @@ but must return `-32001`, never silently resolve them against newer state. Keep 
 least the latest snapshot valid until a newer status response has been returned.
 Zed refreshes and retries a comparison/content batch once on `-32001`.
 
+## Optional History {#optional-history}
+
+Providers may advertise `"history": true` in initialization capabilities. Missing
+or false keeps status-only providers compatible with version `0.1`. History adds
+three read methods; `repository/commit` remains unsupported as a mutation.
+
+`repository/history` takes an immutable starting revision, an optional scoped file
+path, and a limit from 1 to 200:
+
+```json
+{ "repository": "service", "revision": "change-42", "path": null, "limit": 200 }
+```
+
+It returns a recent-first, first-parent history within the workspace scope:
+
+```json
+{
+  "commits": [
+    {
+      "id": "change-42",
+      "parents": ["change-41"],
+      "authorName": "Example",
+      "authorEmail": "example@example.test",
+      "timestamp": 1700000000,
+      "message": "Update service\n\nDetails"
+    }
+  ],
+  "hasMore": true
+}
+```
+
+IDs are opaque nonempty strings, at most 4096 bytes, without NUL. Parents are
+ordered actual parent IDs, including parents outside the returned window; the
+first parent is the diff baseline. IDs in a response are unique, as are each
+commit's parents. `timestamp` is Unix seconds; `message` is the complete commit
+message. Use an empty email when unavailable. An empty repository may return an
+empty list. `hasMore` reports older matching commits beyond this bounded window;
+pagination is not yet implemented. Starting from an older immutable revision
+requests an older window without racing a moving branch.
+
+`repository/commitDetails` takes `{ "repository": "service", "revision": "change-42" }`
+and returns one commit object of the same shape, with the exact requested ID.
+Metadata is not restricted to commits touching the opened scope, so Zed can show
+HEAD details even when its changes are elsewhere.
+
+`repository/commitChanges` takes the same parameters and returns at most 4096
+unique scoped file entries:
+
+```json
+[
+  { "path": "src/example.txt", "base": "old-content", "target": "new-content" },
+  { "path": "new.txt", "base": null, "target": "added-content" },
+  { "path": "gone.txt", "base": "removed-content", "target": null }
+]
+```
+
+`base` and `target` are immutable references read through the existing
+`repository/readContent` method. A null side means absence, not empty content;
+at least one side is present. Compare merges with their first parent and initial
+commits with an empty tree. Omit changes outside the workspace. A rename may use
+the destination path with the original baseline, or separate added/deleted
+entries. Cross-scope moves are additions or deletions within the workspace.
+Return an error for excessive results rather than silently truncating a commit.
+History references do not depend on the current status snapshot; a failed or
+expired history read is surfaced without substituting current file content.
+
+Zed uses its native History tab, commit details, and commit diff viewer locally
+and over SSH. It loads up to 200 recent commits and searches within that window.
+Commit diff loading is bounded to 128 MiB of total before/after content. No VCS
+writes are enabled. The internal Git adapter preserves full hexadecimal IDs and
+maps other IDs to stable synthetic Oids for the existing UI; the external protocol
+never requires Git hashes. File-history suggestions and arbitrary branch browsing
+remain outside this prototype.
+
 ## Refresh Notifications {#refresh-notifications}
 
 A provider may send this notification between any response frames:
@@ -343,7 +417,7 @@ including individual hunk operations, and rejects backend mutations. Ordinary
 file editing remains available. Providers must implement only read operations;
 there is no generic command execution or write-content endpoint.
 
-History, blame, branch switching, conflict resolution, Git diff statistics,
+Blame, branch switching, conflict resolution, Git diff statistics,
 network operations, arbitrary resource groups, and collaboration transport
 are not implemented. Some existing UI labels still say "Git". This adapter is a
 path toward a generic repository model rather than a complete replacement of
@@ -367,7 +441,9 @@ project tests use an in-memory mock for native tree status, live baseline refres
 and blocked writes, plus a mock process for settings, trust revocation, and restart
 behavior. The remote test runs a mock provider behind a headless server and the
 real Zed RPC layer, checking settings isolation, status and baseline refresh,
-read-only controls, rejected writes, resharing, and trust revocation/restart.
+read-only controls, rejected writes, resharing, and trust revocation/restart. It
+also verifies opaque history IDs, metadata, and added/modified/deleted commit
+diffs over SSH.
 
 To inspect a provider through the same Rust client used by Zed:
 
@@ -389,3 +465,6 @@ worktree.
 cargo run -p remote --example vcs_probe -- /work/project src/example.txt \
   ssh user@host 'env ZED_REMOTE_USER_DATA_DIR=/work/zed-dev/profile /work/zed/build/debug/remote_server proxy --identifier vcs-smoke-test'
 ```
+
+Set `ZED_VCS_PROBE_HISTORY=list` to also verify history and metadata, or `diff`
+to open the newest commit diff. Use a small workspace for the latter.
