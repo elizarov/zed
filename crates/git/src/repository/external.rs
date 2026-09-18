@@ -8,6 +8,8 @@ pub struct ExternalRepository {
     root: PathBuf,
     trusted: AtomicBool,
     error: Mutex<Option<String>>,
+    history: Arc<Mutex<HashMap<Oid, CommitData>>>,
+    revisions: Mutex<HashMap<Oid, String>>,
 }
 
 impl ExternalRepository {
@@ -17,7 +19,116 @@ impl ExternalRepository {
             client,
             trusted: AtomicBool::new(true),
             error: Mutex::new(None),
+            history: Default::default(),
+            revisions: Default::default(),
         }
+    }
+
+    fn oid(&self, revision: &str) -> Result<Oid> {
+        let oid = if matches!(revision.len(), 40 | 64) {
+            revision.parse::<Oid>().ok()
+        } else {
+            None
+        };
+        let oid = match oid {
+            Some(oid) => oid,
+            None => {
+                // The native history UI uses Oids; the protocol keeps VCS identifiers opaque.
+                let mut bytes = [0u8; 20];
+                bytes[..4].copy_from_slice(b"vcs!");
+                bytes[4..].copy_from_slice(
+                    Uuid::new_v5(&Uuid::NAMESPACE_OID, revision.as_bytes()).as_bytes(),
+                );
+                Oid::from_bytes(&bytes)?
+            }
+        };
+        let mut revisions = self.revisions.lock();
+        if let Some(previous) = revisions.get(&oid) {
+            anyhow::ensure!(
+                previous == revision,
+                "provider revision identifier collision"
+            );
+        }
+        revisions.insert(oid, revision.to_owned());
+        Ok(oid)
+    }
+
+    fn revision(&self, name: &str) -> Result<String> {
+        if name == "HEAD" {
+            return self
+                .client
+                .snapshot()
+                .revision
+                .context("repository has no current revision");
+        }
+        if let Ok(oid) = name.parse::<Oid>()
+            && let Some(revision) = self.revisions.lock().get(&oid)
+        {
+            return Ok(revision.clone());
+        }
+        Ok(name.to_owned())
+    }
+
+    fn cache_commit(&self, commit: vcs_provider::HistoryCommit) -> Result<CommitData> {
+        let data = CommitData {
+            sha: self.oid(&commit.id)?,
+            parents: commit
+                .parents
+                .iter()
+                .map(|parent| self.oid(parent))
+                .collect::<Result<_>>()?,
+            author_name: commit.author_name.into(),
+            author_email: commit.author_email.into(),
+            commit_timestamp: commit.timestamp,
+            subject: commit
+                .message
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+                .into(),
+            message: commit.message.into(),
+        };
+        self.history.lock().insert(data.sha, data.clone());
+        Ok(data)
+    }
+
+    async fn history_for_source(&self, source: LogSource) -> Result<Vec<CommitData>> {
+        ensure_trusted(self)?;
+        let mut revision = self.revision("HEAD")?;
+        let path = match source {
+            LogSource::All => None,
+            LogSource::Branch(branch) => {
+                anyhow::ensure!(
+                    self.client
+                        .snapshot()
+                        .branch
+                        .as_deref()
+                        .unwrap_or(&self.client.repository.label)
+                        == branch.as_ref(),
+                    "only current-branch provider history is supported"
+                );
+                None
+            }
+            LogSource::Sha(oid) => {
+                revision = self.revision(&oid.to_string())?;
+                None
+            }
+            LogSource::Path(path) => Some(path.to_string()),
+        };
+        let history = self
+            .client
+            .history(
+                &revision,
+                path.as_deref(),
+                vcs_provider::MAX_HISTORY_COMMITS,
+            )
+            .await?;
+        history
+            .commits
+            .into_iter()
+            .map(|commit| self.cache_commit(commit))
+            .collect()
     }
 
     pub async fn refresh(&self) -> Result<()> {
@@ -155,31 +266,57 @@ impl GitRepository for ExternalRepository {
     }
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
         async move {
-            anyhow::ensure!(
-                commit == "HEAD",
-                "history is unavailable for external VCS providers"
-            );
-            let snapshot = self.client.snapshot();
+            ensure_trusted(self)?;
+            if !self.client.supports_history {
+                anyhow::ensure!(commit == "HEAD", "provider does not support history");
+                return Ok(CommitDetails {
+                    sha: self.client.snapshot().revision.unwrap_or_default().into(),
+                    ..Default::default()
+                });
+            }
+            let revision = self.revision(&commit)?;
+            let oid = self.oid(&revision)?;
+            let cached = self.history.lock().get(&oid).cloned();
+            let data = match cached {
+                Some(data) => data,
+                None => self.cache_commit(self.client.commit_details(&revision).await?)?,
+            };
             Ok(CommitDetails {
-                sha: snapshot.revision.unwrap_or_default().into(),
-                ..Default::default()
+                sha: data.sha.to_string().into(),
+                message: data.message,
+                commit_timestamp: data.commit_timestamp,
+                author_email: data.author_email,
+                author_name: data.author_name,
             })
         }
         .boxed()
     }
     fn revparse_batch(&self, revs: Vec<String>) -> BoxFuture<'_, Result<Vec<Option<String>>>> {
-        let revision = self.client.snapshot().revision;
         async move {
-            Ok(revs
-                .iter()
+            ensure_trusted(self)?;
+            let revision = self.client.snapshot().revision;
+            revs.iter()
                 .map(|name| {
                     if name == "HEAD" {
-                        revision.clone()
+                        if self.client.supports_history {
+                            revision
+                                .as_deref()
+                                .map(|revision| self.oid(revision).map(|oid| oid.to_string()))
+                                .transpose()
+                        } else {
+                            Ok(revision.clone())
+                        }
+                    } else if let Ok(oid) = name.parse::<Oid>() {
+                        Ok(self
+                            .revisions
+                            .lock()
+                            .contains_key(&oid)
+                            .then(|| oid.to_string()))
                     } else {
-                        None
+                        Ok(None)
                     }
                 })
-                .collect())
+                .collect()
         }
         .boxed()
     }
@@ -289,11 +426,50 @@ impl GitRepository for ExternalRepository {
     }
     fn load_commit(
         &self,
-        _commit: String,
+        commit: String,
         _ignore_shallow_boundary: bool,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<CommitDiff>> {
-        async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
+        async move {
+            ensure_trusted(self)?;
+            let revision = self.revision(&commit)?;
+            let changes = self.client.commit_changes(&revision).await?;
+            let mut files = Vec::with_capacity(changes.len());
+            let mut bytes = 0usize;
+            for change in changes {
+                let old_content = match change.base {
+                    Some(reference) => Some(self.client.read_content(&reference).await?),
+                    None => None,
+                };
+                let new_content = match change.target {
+                    Some(reference) => Some(self.client.read_content(&reference).await?),
+                    None => None,
+                };
+                bytes += old_content.as_ref().map_or(0, Vec::len)
+                    + new_content.as_ref().map_or(0, Vec::len);
+                anyhow::ensure!(
+                    bytes <= 128 * 1024 * 1024,
+                    "commit diff exceeds the 128 MiB prototype limit; open a narrower workspace"
+                );
+                let is_binary = old_content
+                    .as_ref()
+                    .is_some_and(|value| is_binary_content(value))
+                    || new_content
+                        .as_ref()
+                        .is_some_and(|value| is_binary_content(value));
+                files.push(CommitFile {
+                    path: RepoPath::from_rel_path(RelPath::from_unix_str(&change.path)?),
+                    old_content,
+                    new_content,
+                    is_binary,
+                });
+            }
+            Ok(CommitDiff {
+                files,
+                is_shallow_boundary: false,
+            })
+        }
+        .boxed()
     }
     fn blame(
         &self,
@@ -468,19 +644,64 @@ impl GitRepository for ExternalRepository {
     }
     fn initial_graph_data(
         &self,
-        _log_source: LogSource,
-        _log_order: LogOrder,
-        _request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
+        log_source: LogSource,
+        log_order: LogOrder,
+        request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
-        async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
+        async move {
+            let mut commits = self.history_for_source(log_source).await?;
+            if log_order == LogOrder::ReverseChronological {
+                commits.reverse();
+            }
+            let commits = commits
+                .into_iter()
+                .map(|commit| {
+                    Arc::new(InitialGraphCommitData {
+                        sha: commit.sha,
+                        parents: commit.parents,
+                        ref_names: Vec::new(),
+                    })
+                })
+                .collect();
+            request_tx
+                .send(commits)
+                .await
+                .context("history receiver closed")?;
+            Ok(())
+        }
+        .boxed()
     }
     fn search_commits(
         &self,
-        _log_source: LogSource,
-        _search_args: SearchCommitArgs,
-        _request_tx: Sender<Oid>,
+        log_source: LogSource,
+        search_args: SearchCommitArgs,
+        request_tx: Sender<Oid>,
     ) -> BoxFuture<'_, Result<()>> {
-        async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
+        async move {
+            for commit in self.history_for_source(log_source).await? {
+                let text = format!(
+                    "{} {} {} {}",
+                    self.revision(&commit.sha.to_string())?,
+                    commit.author_name,
+                    commit.author_email,
+                    commit.message
+                );
+                let matches = if search_args.case_sensitive {
+                    text.contains(search_args.query.as_ref())
+                } else {
+                    text.to_lowercase()
+                        .contains(&search_args.query.to_lowercase())
+                };
+                if matches {
+                    request_tx
+                        .send(commit.sha)
+                        .await
+                        .context("history search receiver closed")?;
+                }
+            }
+            Ok(())
+        }
+        .boxed()
     }
     fn file_history_changed_files(
         &self,
@@ -490,7 +711,12 @@ impl GitRepository for ExternalRepository {
         async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
     }
     fn commit_data_reader(&self) -> Result<CommitDataReader> {
-        bail!("operation unavailable: external VCS provider is read-only")
+        ensure_trusted(self)?;
+        anyhow::ensure!(
+            self.client.supports_history,
+            "provider does not support history"
+        );
+        Ok(CommitDataReader::from_cache(self.history.clone()))
     }
     fn update_ref(&self, _ref_name: String, _commit: String) -> BoxFuture<'_, Result<()>> {
         async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()

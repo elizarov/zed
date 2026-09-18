@@ -91,6 +91,57 @@ pub struct Comparison {
     pub index: Option<String>,
 }
 
+pub const MAX_HISTORY_COMMITS: usize = 200;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryCommit {
+    pub id: String,
+    pub parents: Vec<String>,
+    pub author_name: String,
+    pub author_email: String,
+    pub timestamp: i64,
+    pub message: String,
+}
+
+impl HistoryCommit {
+    fn validate(&self) -> Result<()> {
+        validate_revision(&self.id)?;
+        let mut parents = HashSet::new();
+        for parent in &self.parents {
+            validate_revision(parent)?;
+            ensure!(
+                parent != &self.id && parents.insert(parent),
+                "invalid commit parents"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct History {
+    pub commits: Vec<HistoryCommit>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitChange {
+    pub path: String,
+    pub base: Option<String>,
+    pub target: Option<String>,
+}
+
+fn validate_revision(revision: &str) -> Result<()> {
+    ensure!(
+        !revision.is_empty() && revision.len() <= 4096 && !revision.contains('\0'),
+        "invalid revision identifier"
+    );
+    Ok(())
+}
+
 pub fn validate_path(path: &str) -> Result<()> {
     ensure!(
         !path.is_empty() && !path.contains(['\\', '\0', ':']),
@@ -262,6 +313,7 @@ pub struct Client {
     transport: std::sync::Arc<Mutex<Connection>>,
     pub repository: RepositoryInfo,
     pub supports_staging: bool,
+    pub supports_history: bool,
     snapshot: RwLock<Snapshot>,
 }
 
@@ -302,6 +354,8 @@ impl Client {
         struct Capabilities {
             read_only: bool,
             staging: bool,
+            #[serde(default)]
+            history: bool,
         }
         let initialized: Initialization = transport
             .request(
@@ -337,6 +391,7 @@ impl Client {
             transport: std::sync::Arc::new(Mutex::new(Connection::Process(transport))),
             repository,
             supports_staging: initialized.capabilities.staging,
+            supports_history: initialized.capabilities.history,
             snapshot: RwLock::new(snapshot),
         })
     }
@@ -351,6 +406,7 @@ impl Client {
         Ok(Self {
             repository,
             supports_staging: true,
+            supports_history: false,
             snapshot: RwLock::new(snapshot),
             transport: std::sync::Arc::new(Mutex::new(Connection::Mock(Box::new(handler)))),
         })
@@ -394,6 +450,109 @@ impl Client {
         snapshot.validate()?;
         *self.snapshot.write() = snapshot;
         Ok(())
+    }
+
+    pub async fn history(
+        &self,
+        revision: &str,
+        path: Option<&str>,
+        limit: usize,
+    ) -> Result<History> {
+        ensure!(
+            self.supports_history,
+            "VCS provider does not support history"
+        );
+        validate_revision(revision)?;
+        ensure!(
+            (1..=MAX_HISTORY_COMMITS).contains(&limit),
+            "invalid history limit"
+        );
+        if let Some(path) = path {
+            validate_path(path)?;
+        }
+        let history: History = self.transport.lock().await.request(
+            "repository/history",
+            json!({"repository":self.repository.id, "revision":revision, "path":path, "limit":limit}),
+        ).await?;
+        ensure!(
+            history.commits.len() <= limit,
+            "provider exceeded history limit"
+        );
+        let mut ids = HashSet::new();
+        for commit in &history.commits {
+            commit.validate()?;
+            ensure!(ids.insert(&commit.id), "duplicate history commit");
+        }
+        Ok(history)
+    }
+
+    pub async fn commit_details(&self, revision: &str) -> Result<HistoryCommit> {
+        ensure!(
+            self.supports_history,
+            "VCS provider does not support history"
+        );
+        validate_revision(revision)?;
+        let commit: HistoryCommit = self
+            .transport
+            .lock()
+            .await
+            .request(
+                "repository/commitDetails",
+                json!({"repository":self.repository.id, "revision":revision}),
+            )
+            .await?;
+        commit.validate()?;
+        ensure!(commit.id == revision, "wrong commit identifier");
+        Ok(commit)
+    }
+
+    pub async fn commit_changes(&self, revision: &str) -> Result<Vec<CommitChange>> {
+        ensure!(
+            self.supports_history,
+            "VCS provider does not support history"
+        );
+        validate_revision(revision)?;
+        let changes: Vec<CommitChange> = self
+            .transport
+            .lock()
+            .await
+            .request(
+                "repository/commitChanges",
+                json!({"repository":self.repository.id, "revision":revision}),
+            )
+            .await?;
+        ensure!(changes.len() <= 4096, "commit exceeds the file limit");
+        let mut paths = HashSet::new();
+        for change in &changes {
+            validate_path(&change.path)?;
+            ensure!(paths.insert(&change.path), "duplicate commit path");
+            ensure!(
+                change.base.is_some() || change.target.is_some(),
+                "empty commit change"
+            );
+        }
+        Ok(changes)
+    }
+
+    pub async fn read_content(&self, reference: &str) -> Result<Vec<u8>> {
+        #[derive(Deserialize)]
+        struct Content {
+            encoding: String,
+            data: String,
+        }
+        let content: Content = self
+            .transport
+            .lock()
+            .await
+            .request(
+                "repository/readContent",
+                json!({"repository":self.repository.id, "content":reference}),
+            )
+            .await?;
+        ensure!(content.encoding == "base64", "unsupported content encoding");
+        STANDARD
+            .decode(content.data)
+            .context("invalid base64 content")
     }
 
     pub async fn contents(
