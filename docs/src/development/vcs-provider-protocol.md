@@ -52,7 +52,12 @@ The provider's protocol is unchanged: framed JSON-RPC stays on the host. Zed's
 existing remote transport carries repository snapshots, incremental status
 updates, and requested diff baselines to the editor. Repository updates include
 `is_read_only`; both the client controls and the host backend reject VCS writes.
-Ordinary file editing remains available.
+Ordinary file editing remains available. A per-worktree
+`UpdateRepositoryDiscovery` message reports provider startup and errors before a
+repository exists. Both panel tabs show “Loading repository…” until the initial
+status snapshot arrives; failed startup shows “Failed to load repository”. Trust
+revocation and worktree removal clear this state. It is synchronized when the
+project is reshared, and is not forwarded to collaboration guests.
 
 Configure `vcs_provider` in the **server settings**, or in a trusted remote
 project's `.zed/settings.json`. Client user settings do not forward this setting,
@@ -443,7 +448,7 @@ behavior. The remote test runs a mock provider behind a headless server and the
 real Zed RPC layer, checking settings isolation, status and baseline refresh,
 read-only controls, rejected writes, resharing, and trust revocation/restart. It
 also verifies opaque history IDs, metadata, and added/modified/deleted commit
-diffs over SSH.
+diffs over SSH, plus startup loading, completion, failure, and cancellation.
 
 To inspect a provider through the same Rust client used by Zed:
 

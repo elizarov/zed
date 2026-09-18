@@ -51,7 +51,14 @@ while True:
             {"path": "deleted.txt", "status": "deleted"},
         ]}
         if mode == "remote":
-            state = json.loads(Path(sys.argv[2]).read_text())
+            state_path = Path(sys.argv[2])
+            state = json.loads(state_path.read_text())
+            while state.get("pauseStatus"):
+                time.sleep(0.01)
+                state = json.loads(state_path.read_text())
+            if state.get("failStatus"):
+                send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32000, "message": "mock startup failed"}})
+                continue
             result = {"snapshot": state["snapshot"], "revision": "revision-2", "branch": "remote-branch", "changes": state["changes"]}
         send({"jsonrpc": "2.0", "method": "repository/changed", "params": {"repository": "mock"}})
     elif method == "repository/comparison":

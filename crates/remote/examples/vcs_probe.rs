@@ -14,6 +14,8 @@ struct Probe {
     next_id: u32,
     ack_id: Option<u32>,
     next_worktree_id: u64,
+    saw_repository_loading: bool,
+    repository_loading: bool,
     repositories: BTreeMap<u64, proto::UpdateRepository>,
 }
 
@@ -57,6 +59,14 @@ impl Probe {
                         ),
                     )
                     .await?;
+                }
+                Some(Payload::UpdateRepositoryDiscovery(update)) => {
+                    if let Some(error) = &update.error {
+                        bail!("repository startup failed: {error}");
+                    }
+                    self.repository_loading = update.loading;
+                    self.saw_repository_loading |= update.loading;
+                    println!("Repository loading: {}", update.loading);
                 }
                 Some(Payload::UpdateRepository(update)) => {
                     let repository = self.repositories.entry(update.id).or_default();
@@ -116,6 +126,8 @@ fn main() -> Result<()> {
             next_id: 1,
             ack_id: None,
             next_worktree_id: 1,
+            saw_repository_loading: false,
+            repository_loading: false,
             repositories: BTreeMap::new(),
         };
         probe.request(proto::RemoteStarted {}).await?;
@@ -153,6 +165,13 @@ fn main() -> Result<()> {
             }
             probe.receive().await?;
         }
+        while probe.repository_loading {
+            probe.receive().await?;
+        }
+        ensure!(
+            probe.saw_repository_loading,
+            "missing repository startup notification"
+        );
         let buffer = probe
             .request(proto::OpenBufferByPath {
                 project_id,

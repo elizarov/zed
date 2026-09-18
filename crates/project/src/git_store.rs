@@ -102,6 +102,7 @@ mod external;
 
 pub struct GitStore {
     external_starts: HashMap<WorktreeId, Task<()>>,
+    external_discovery: HashMap<WorktreeId, RepositoryDiscoveryState>,
     state: GitStoreState,
     project: Option<WeakEntity<Project>>,
     buffer_store: Entity<BufferStore>,
@@ -483,6 +484,7 @@ enum GitStoreState {
 }
 
 enum DownstreamUpdate {
+    UpdateRepositoryDiscovery(proto::UpdateRepositoryDiscovery),
     UpdateRepository(RepositorySnapshot),
     RemoveRepository(RepositoryId),
 }
@@ -857,8 +859,15 @@ pub enum RepositoryEvent {
 #[derive(Clone, Debug)]
 pub struct JobsUpdated;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepositoryDiscoveryState {
+    Loading,
+    Failed(SharedString),
+}
+
 #[derive(Debug)]
 pub enum GitStoreEvent {
+    RepositoryDiscoveryChanged,
     ActiveRepositoryChanged(Option<RepositoryId>),
     /// Bool is true when the repository that's updated is the active repository
     RepositoryUpdated(RepositoryId, RepositoryEvent, bool),
@@ -1021,6 +1030,7 @@ impl GitStore {
         let diff_base_setting = ProjectSettings::get_global(cx).git.diff_base;
         GitStore {
             external_starts: HashMap::default(),
+            external_discovery: HashMap::default(),
             state,
             project: None,
             buffer_store,
@@ -1093,6 +1103,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_blame_buffer);
         client.add_entity_request_handler(Self::handle_blame_buffer_at_revision);
         client.add_entity_message_handler(Self::handle_update_repository);
+        client.add_entity_message_handler(Self::handle_update_repository_discovery);
         client.add_entity_message_handler(Self::handle_remove_repository);
         client.add_entity_request_handler(Self::handle_git_clone);
         client.add_entity_request_handler(Self::handle_get_worktrees);
@@ -1162,6 +1173,17 @@ impl GitStore {
     }
 
     pub fn shared(&mut self, project_id: u64, client: AnyProtoClient, cx: &mut Context<Self>) {
+        if !client.is_via_collab() {
+            for (worktree_id, state) in &self.external_discovery {
+                client
+                    .send(Self::discovery_update(
+                        project_id,
+                        *worktree_id,
+                        Some(state),
+                    ))
+                    .log_err();
+            }
+        }
         match &mut self.state {
             GitStoreState::Remote {
                 downstream: downstream_client,
@@ -1203,6 +1225,11 @@ impl GitStore {
                         cx.background_spawn(async move {
                             while let Some(update) = updates_rx.next().await {
                                 match update {
+                                    DownstreamUpdate::UpdateRepositoryDiscovery(update) => {
+                                        if !client.is_via_collab() {
+                                            client.send(update)?;
+                                        }
+                                    }
                                     DownstreamUpdate::UpdateRepository(snapshot) => {
                                         // A scan already in flight when trust was revoked may finish late.
                                         if removed_repositories.contains(&snapshot.id)
@@ -2504,6 +2531,9 @@ impl GitStore {
             ..
         } = &self.state
         else {
+            if let WorktreeStoreEvent::WorktreeRemoved(_, worktree_id) = event {
+                self.set_repository_discovery(*worktree_id, None, cx);
+            }
             return;
         };
 
@@ -2587,6 +2617,7 @@ impl GitStore {
                     }
                 }
 
+                self.set_repository_discovery(*worktree_id, None, cx);
                 if is_active_repo_removed {
                     if let Some((&repo_id, _)) = self.repositories.iter().next() {
                         self.active_repo_id = Some(repo_id);
@@ -3097,6 +3128,7 @@ impl GitStore {
             for path in event_paths {
                 if let PathTrust::Worktree(worktree_id) = path {
                     self.external_starts.remove(worktree_id);
+                    self.set_repository_discovery(*worktree_id, None, cx);
                 }
             }
             let removed = self

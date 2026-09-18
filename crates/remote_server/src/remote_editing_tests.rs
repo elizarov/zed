@@ -3525,7 +3525,11 @@ async fn test_add_path_to_git_info_exclude_in_remote_repository(
 #[gpui::test]
 async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     use git::repository::repo_path;
-    use project::{git_store::GitStoreEvent, project_settings::ProjectSettings, trusted_worktrees};
+    use project::{
+        git_store::{GitStoreEvent, RepositoryDiscoveryState},
+        project_settings::ProjectSettings,
+        trusted_worktrees,
+    };
     use std::time::Duration;
 
     cx.executor().allow_parking();
@@ -3536,7 +3540,7 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
     smol::fs::write(
         &state_path,
         json!({
-            "snapshot": "1", "changes": [
+            "snapshot": "1", "pauseStatus": true, "changes": [
                 {"path": "hello.txt", "status": "modified", "stagedStatus": "modified"},
                 {"path": "gone.txt", "status": "deleted"}
             ]
@@ -3604,6 +3608,57 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
         .await
         .unwrap();
     store
+        .condition::<GitStoreEvent>(cx, |store, _| {
+            matches!(
+                store.repository_discovery_state(),
+                Some(RepositoryDiscoveryState::Loading)
+            )
+        })
+        .await;
+    assert!(store.read_with(cx, |store, _| store.active_repository().is_none()));
+    assert!(server_store.read_with(server_cx, |store, _| matches!(
+        store.repository_discovery_state(),
+        Some(RepositoryDiscoveryState::Loading)
+    )));
+    // Revoking trust while the provider is blocked must clear the loading state.
+    client
+        .request(proto::RestrictWorktrees {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            worktree_ids: vec![worktree_id.to_proto()],
+        })
+        .await
+        .unwrap();
+    store
+        .condition::<GitStoreEvent>(cx, |store, _| store.repository_discovery_state().is_none())
+        .await;
+    client
+        .request(proto::TrustWorktrees {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            trusted_paths: vec![proto::PathTrust {
+                content: Some(proto::path_trust::Content::WorktreeId(
+                    worktree_id.to_proto(),
+                )),
+            }],
+        })
+        .await
+        .unwrap();
+    store
+        .condition::<GitStoreEvent>(cx, |store, _| {
+            matches!(
+                store.repository_discovery_state(),
+                Some(RepositoryDiscoveryState::Loading)
+            )
+        })
+        .await;
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&smol::fs::read(&state_path).await.unwrap()).unwrap();
+    state["pauseStatus"] = false.into();
+    let replacement = state_path.with_extension("new");
+    smol::fs::write(&replacement, state.to_string())
+        .await
+        .unwrap();
+    smol::fs::rename(&replacement, &state_path).await.unwrap();
+    store
         .condition::<GitStoreEvent>(cx, |store, cx| {
             store.active_repository().is_some_and(|repo| {
                 repo.read(cx)
@@ -3611,6 +3666,9 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
                     .is_some()
             })
         })
+        .await;
+    store
+        .condition::<GitStoreEvent>(cx, |store, _| store.repository_discovery_state().is_none())
         .await;
     let repository = store.read_with(cx, |store, cx| {
         let repository = store.active_repository().unwrap();
@@ -3831,6 +3889,46 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
     assert!(store.read_with(cx, |store, cx| {
         store.active_repository().unwrap().read(cx).is_read_only()
     }));
+    // A failed startup must replace Loading with an error on both hosts.
+    client
+        .request(proto::RestrictWorktrees {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            worktree_ids: vec![worktree_id.to_proto()],
+        })
+        .await
+        .unwrap();
+    smol::fs::write(&state_path, json!({"failStatus": true}).to_string())
+        .await
+        .unwrap();
+    client
+        .request(proto::TrustWorktrees {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            trusted_paths: vec![proto::PathTrust {
+                content: Some(proto::path_trust::Content::WorktreeId(
+                    worktree_id.to_proto(),
+                )),
+            }],
+        })
+        .await
+        .unwrap();
+    store.condition::<GitStoreEvent>(cx, |store, _| {
+        matches!(store.repository_discovery_state(), Some(RepositoryDiscoveryState::Failed(error)) if error.contains("mock startup failed"))
+    }).await;
+    assert!(store.read_with(cx, |store, _| store.active_repository().is_none()));
+    assert!(server_store.read_with(server_cx, |store, _| matches!(
+        store.repository_discovery_state(),
+        Some(RepositoryDiscoveryState::Failed(_))
+    )));
+    client
+        .request(proto::RestrictWorktrees {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            worktree_ids: vec![worktree_id.to_proto()],
+        })
+        .await
+        .unwrap();
+    store
+        .condition::<GitStoreEvent>(cx, |store, _| store.repository_discovery_state().is_none())
+        .await;
     assert!(fs.metadata(&root.join(".git")).await.unwrap().is_none());
     assert_eq!(
         fs.load(&root.join("hello.txt")).await.unwrap(),

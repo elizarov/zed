@@ -66,7 +66,8 @@ use project::git_store::GitAccess;
 use project::{
     Fs, Project, ProjectPath,
     git_store::{
-        CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId, pending_op,
+        CommitDataState, GitStoreEvent, Repository, RepositoryDiscoveryState, RepositoryEvent,
+        RepositoryId, pending_op,
     },
     project_settings::{GitPathStyle, ProjectSettings},
 };
@@ -1387,6 +1388,7 @@ impl GitPanel {
                     | GitStoreEvent::ActiveRepositoryChanged(_) => {
                         this.schedule_update(window, cx);
                     }
+                    GitStoreEvent::RepositoryDiscoveryChanged => cx.notify(),
                     GitStoreEvent::GlobalConfigurationUpdated => {
                         this.git_access = None;
                         this.schedule_update(window, cx);
@@ -6958,13 +6960,26 @@ impl GitPanel {
             ))
     }
 
+    fn repository_discovery_message(&self, cx: &App) -> Option<&'static str> {
+        let store = self.project.read(cx).git_store().read(cx);
+        if self.active_repository.is_none() && store.active_repository().is_some() {
+            return Some("Loading repository…");
+        }
+        match store.repository_discovery_state() {
+            Some(RepositoryDiscoveryState::Loading) => Some("Loading repository…"),
+            Some(RepositoryDiscoveryState::Failed(_)) => Some("Failed to load repository"),
+            None => None,
+        }
+    }
+
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex().flex_1().size_full().overflow_hidden().map(|this| {
             let has_repo = self.active_repository.is_some();
             match &self.commit_history {
-                _ if !has_repo => {
-                    this.child(Self::render_history_placeholder("No repository found"))
-                }
+                _ if !has_repo => this.child(Self::render_history_placeholder(
+                    self.repository_discovery_message(cx)
+                        .unwrap_or("No repository found"),
+                )),
                 CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
                     "Failed to load commit history",
                 )),
@@ -7636,6 +7651,9 @@ impl GitPanel {
     }
 
     fn render_uninitialized_ui(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(message) = self.repository_discovery_message(cx) {
+            return Self::render_history_placeholder(message).into_any_element();
+        }
         let worktree_count = self.project.read(cx).visible_worktrees(cx).count();
         if worktree_count > 0 && self.active_repository.is_none() {
             v_flex()
