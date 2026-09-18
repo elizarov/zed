@@ -5118,8 +5118,16 @@ impl GitPanel {
     }
 
     fn reopen_commit_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active_repo) = self.active_repository.as_ref() else {
+        // Status updates can arrive in hundreds of chunks. Read-only providers
+        // have no commit editor, so do not fill the repository queue with its setup.
+        let Some(active_repo) = self
+            .active_repository
+            .as_ref()
+            .filter(|repository| !repository.read(cx).is_read_only())
+        else {
             self.reopen_commit_buffer_task = Task::ready(());
+            self._commit_message_buffer_subscription = None;
+            self.commit_template = None;
             return;
         };
         let active_repository_abs_path = active_repo
@@ -8774,6 +8782,9 @@ impl GitPanel {
         let Some(repo) = self.active_repository.clone() else {
             return Task::ready(Err(anyhow::anyhow!("no active repo")));
         };
+        if repo.read(cx).is_read_only() {
+            return Task::ready(Ok(None));
+        }
         repo.update(cx, |repo, cx| {
             let rx = repo.load_commit_template_text();
             cx.spawn(async move |_, _| rx.await?)
@@ -9976,6 +9987,78 @@ mod tests {
         await_git_panel_entries(&panel, &mut cx).await;
 
         (fs, project, workspace, panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_read_only_status_updates_do_not_queue_commit_editor_jobs(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (_, project, workspace, panel, mut cx) = setup_git_panel_with_changes(
+            cx,
+            json!({".git": {}, "file": "modified\n"}),
+            &[("file", StatusCode::Modified)],
+        )
+        .await;
+        let repository =
+            project.read_with(&cx, |project, cx| project.active_repository(cx).unwrap());
+        repository.update(&mut cx, |repository, cx| {
+            repository.set_read_only_for_test(true, cx);
+        });
+        cx.run_until_parked();
+        let jobs_before = repository.read_with(&cx, |repository, _| {
+            repository.job_debug_queue().to_debug_value()["entries"].clone()
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert!(!panel.has_write_access(cx));
+            // Reproduce chunked remote snapshots arriving before async setup finishes.
+            for _ in 0..300 {
+                panel.schedule_update(window, cx);
+            }
+        });
+        assert!(
+            panel
+                .update(&mut cx, |panel, cx| panel.load_commit_template(cx))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let jobs_after = repository.read_with(&cx, |repository, _| {
+            repository.job_debug_queue().to_debug_value()["entries"].clone()
+        });
+        assert_eq!(
+            jobs_before.as_array().unwrap().len(),
+            jobs_after.as_array().unwrap().len()
+        );
+        let sha = "0123456789012345678901234567890123456789".to_owned();
+        cx.update(|window, cx| {
+            CommitView::open(
+                sha,
+                repository.downgrade(),
+                workspace.downgrade(),
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
+        repository
+            .update(&mut cx, |repository, _| repository.barrier())
+            .await
+            .unwrap();
+        repository.read_with(&cx, |repository, _| {
+            let jobs = repository.job_debug_queue().to_debug_value();
+            assert_eq!(jobs["summary"]["pending"], 0);
+            assert_eq!(jobs["summary"]["running"], 0);
+            assert!(
+                jobs["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|job| job["description"] == "load_commit_diff"
+                        && job["status"] == "Finished")
+            );
+        });
     }
 
     #[gpui::test]

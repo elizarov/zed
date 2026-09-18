@@ -3717,6 +3717,28 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
         buffer.edit([(0..0, "unsaved\n")], None, cx)
     });
     let repository_id = repository.read_with(cx, |repo, _| repo.id.to_proto());
+    assert!(
+        client
+            .request(proto::OpenCommitMessageBuffer {
+                project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                repository_id,
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("read-only")
+    );
+    let template = client
+        .request(proto::LoadCommitTemplate {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            repository_id,
+        })
+        .await
+        .unwrap();
+    assert!(template.template.is_none());
+    assert!(repository.read_with(cx, |repository, _| {
+        repository.commit_message_buffer().is_none()
+    }));
     let mut history_stream = client
         .request_stream(proto::GetInitialGraphData {
             project_id: proto::REMOTE_SERVER_PROJECT_ID,

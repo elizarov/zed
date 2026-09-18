@@ -5022,10 +5022,15 @@ impl GitStore {
         let rx = this
             .update(&mut cx, |this, cx| {
                 let repository = this.repositories().get(&repository_id)?;
-                Some(repository.update(cx, |repo, _| repo.load_commit_template_text()))
+                Some(repository.update(cx, |repo, _| {
+                    (!repo.is_read_only()).then(|| repo.load_commit_template_text())
+                }))
             })
             .context("missing repository")?;
-        let template = rx.await??;
+        let template = match rx {
+            Some(rx) => rx.await??,
+            None => None,
+        };
         Ok(proto::LoadCommitTemplateResponse {
             template: template.map(|t| t.template),
         })
@@ -7174,6 +7179,9 @@ impl Repository {
         buffer_store: Entity<BufferStore>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Buffer>>> {
+        if self.is_read_only() {
+            return Task::ready(Err(anyhow!("read-only repositories have no commit editor")));
+        }
         let id = self.id;
         if let Some(buffer) = self.commit_message_buffer.clone() {
             return Task::ready(Ok(buffer));
@@ -10629,6 +10637,12 @@ impl Repository {
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut Context<Self>,
     ) {
+        // Providers publish their own snapshots and refresh diff bases when they
+        // change. Re-filtering that cached snapshot for each worktree scan batch
+        // cannot discover changes and can starve history requests in large trees.
+        if self.external_backend.is_some() {
+            return;
+        }
         if !paths.is_empty() {
             self.paths_needing_status_update.push(paths);
         }
@@ -11561,6 +11575,11 @@ async fn append_pattern_to_ignore_file(
 
 #[cfg(any(test, feature = "test-support"))]
 impl Repository {
+    pub fn set_read_only_for_test(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        self.snapshot.is_read_only = read_only;
+        cx.emit(RepositoryEvent::StatusesChanged);
+    }
+
     pub fn set_branch_list_for_test(&mut self, branches: Vec<Branch>, cx: &mut Context<Self>) {
         self.snapshot.branch_list = branches.into();
         cx.emit(RepositoryEvent::BranchListChanged);
