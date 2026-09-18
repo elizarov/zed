@@ -1,7 +1,7 @@
 use super::*;
 use crate::status::{UnmergedStatus, UnmergedStatusCode};
 use std::sync::atomic::Ordering as AtomicOrdering;
-use vcs_provider::{ChangeKind, Client};
+use vcs_provider::{ChangeKind, Client, ReferenceKind};
 
 pub struct ExternalRepository {
     pub client: Client,
@@ -99,15 +99,29 @@ impl ExternalRepository {
         let path = match source {
             LogSource::All => None,
             LogSource::Branch(branch) => {
-                anyhow::ensure!(
-                    self.client
-                        .snapshot()
-                        .branch
-                        .as_deref()
-                        .unwrap_or(&self.client.repository.label)
-                        == branch.as_ref(),
-                    "only current-branch provider history is supported"
-                );
+                let snapshot = self.client.snapshot();
+                if let Some(reference) = snapshot
+                    .references
+                    .iter()
+                    .find(|reference| reference_name(reference) == branch.as_ref())
+                    .or_else(|| {
+                        snapshot
+                            .references
+                            .iter()
+                            .find(|reference| reference.name == branch.as_ref())
+                    })
+                {
+                    revision = reference.revision.clone();
+                } else {
+                    anyhow::ensure!(
+                        snapshot
+                            .branch
+                            .as_deref()
+                            .unwrap_or(&self.client.repository.label)
+                            == branch.as_ref(),
+                        "unknown provider reference: {branch}"
+                    );
+                }
                 None
             }
             LogSource::Sha(oid) => {
@@ -176,7 +190,31 @@ fn file_status(change: &vcs_provider::Change) -> FileStatus {
     }
 }
 
+fn reference_name(reference: &vcs_provider::Reference) -> String {
+    let prefix = match reference.kind {
+        ReferenceKind::Branch => "refs/heads/",
+        ReferenceKind::RemoteBranch => "refs/remotes/",
+        ReferenceKind::Tag => "refs/tags/",
+    };
+    format!("{prefix}{}", reference.name)
+}
+
 impl GitRepository for ExternalRepository {
+    fn capabilities(&self) -> RepositoryCapabilities {
+        let capabilities = self.client.capabilities;
+        let mut features = RepositoryCapabilities::empty();
+        for (enabled, feature) in [
+            (capabilities.staging, RepositoryCapabilities::STAGING),
+            (capabilities.history, RepositoryCapabilities::HISTORY),
+            (capabilities.branches, RepositoryCapabilities::BRANCHES),
+            (capabilities.tags, RepositoryCapabilities::TAGS),
+            (capabilities.tracking, RepositoryCapabilities::TRACKING),
+        ] {
+            features.set(feature, enabled);
+        }
+        features
+    }
+
     fn is_read_only(&self) -> bool {
         true
     }
@@ -250,16 +288,53 @@ impl GitRepository for ExternalRepository {
     }
     fn branches(&self) -> BoxFuture<'_, Result<BranchesScanResult>> {
         let snapshot = self.client.snapshot();
-        let branch = snapshot
-            .branch
-            .unwrap_or_else(|| self.client.repository.label.clone());
-        let result = BranchesScanResult {
-            branches: vec![Branch {
+        let mut branches = Vec::new();
+        if self.client.capabilities.branches {
+            for reference in &snapshot.references {
+                if reference.kind == ReferenceKind::Tag {
+                    continue;
+                }
+                let upstream = if self.client.capabilities.tracking {
+                    reference.upstream.as_ref().map(|upstream| Upstream {
+                        ref_name: format!("refs/remotes/{}", upstream.name).into(),
+                        tracking: if upstream.gone {
+                            UpstreamTracking::Gone
+                        } else if let (Some(ahead), Some(behind)) =
+                            (upstream.ahead, upstream.behind)
+                        {
+                            UpstreamTracking::Tracked(UpstreamTrackingStatus { ahead, behind })
+                        } else {
+                            UpstreamTracking::Unknown
+                        },
+                    })
+                } else {
+                    None
+                };
+                branches.push(Branch {
+                    is_head: reference.kind == ReferenceKind::Branch
+                        && snapshot.branch.as_deref() == Some(&reference.name)
+                        && snapshot.revision.as_deref() == Some(&reference.revision),
+                    ref_name: reference_name(reference).into(),
+                    upstream,
+                    most_recent_commit: reference.commit.as_ref().map(|commit| CommitSummary {
+                        sha: reference.revision.clone().into(),
+                        subject: commit.subject.clone().into(),
+                        author_name: commit.author_name.clone().into(),
+                        commit_timestamp: commit.timestamp,
+                        has_parent: true,
+                    }),
+                });
+            }
+        } else if let Some(branch) = snapshot.branch {
+            branches.push(Branch {
                 is_head: true,
                 ref_name: branch.into(),
                 upstream: None,
                 most_recent_commit: None,
-            }],
+            });
+        }
+        let result = BranchesScanResult {
+            branches,
             error: self.error.lock().clone().map(Into::into),
         };
         async move { Ok(result) }.boxed()
@@ -267,7 +342,7 @@ impl GitRepository for ExternalRepository {
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
         async move {
             ensure_trusted(self)?;
-            if !self.client.supports_history {
+            if !self.client.capabilities.history {
                 anyhow::ensure!(commit == "HEAD", "provider does not support history");
                 return Ok(CommitDetails {
                     sha: self.client.snapshot().revision.unwrap_or_default().into(),
@@ -298,7 +373,7 @@ impl GitRepository for ExternalRepository {
             revs.iter()
                 .map(|name| {
                     if name == "HEAD" {
-                        if self.client.supports_history {
+                        if self.client.capabilities.history {
                             revision
                                 .as_deref()
                                 .map(|revision| self.oid(revision).map(|oid| oid.to_string()))
@@ -346,7 +421,7 @@ impl GitRepository for ExternalRepository {
         async { Ok(Vec::new()) }.boxed()
     }
     fn load_blob_content(&self, _oid: Oid) -> BoxFuture<'_, Result<Vec<u8>>> {
-        async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
+        async { bail!("VCS provider does not support arbitrary revision content") }.boxed()
     }
     fn set_index_text(
         &self,
@@ -358,7 +433,7 @@ impl GitRepository for ExternalRepository {
         async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
     }
     fn diff_tree(&self, _request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>> {
-        async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
+        async { bail!("VCS provider does not support branch comparisons") }.boxed()
     }
     fn change_branch(&self, _name: String) -> BoxFuture<'_, Result<()>> {
         async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
@@ -501,14 +576,14 @@ impl GitRepository for ExternalRepository {
         _content: Rope,
         _line_ending: LineEnding,
     ) -> BoxFuture<'_, Result<crate::blame::Blame>> {
-        async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
+        async { bail!("VCS provider does not support blame") }.boxed()
     }
     fn blame_at_revision(
         &self,
         _path: RepoPath,
         _revision: Oid,
     ) -> BoxFuture<'_, Result<crate::blame::Blame>> {
-        async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
+        async { bail!("VCS provider does not support historical blame") }.boxed()
     }
     fn stage_paths(
         &self,
@@ -625,7 +700,7 @@ impl GitRepository for ExternalRepository {
         async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
     }
     fn diff(&self, _diff: DiffType) -> BoxFuture<'_, Result<String>> {
-        async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
+        async { bail!("VCS provider does not support textual diffs") }.boxed()
     }
     fn checkpoint(&self) -> BoxFuture<'static, Result<GitRepositoryCheckpoint>> {
         async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
@@ -664,7 +739,7 @@ impl GitRepository for ExternalRepository {
         &self,
         _include_remote_name: bool,
     ) -> BoxFuture<'_, Result<Option<SharedString>>> {
-        async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
+        async { bail!("VCS provider does not support default branch") }.boxed()
     }
     fn initial_graph_data(
         &self,
@@ -677,13 +752,44 @@ impl GitRepository for ExternalRepository {
             if log_order == LogOrder::ReverseChronological {
                 commits.reverse();
             }
+            let snapshot = self.client.snapshot();
+            let mut decorations: HashMap<Oid, Vec<SharedString>> = HashMap::default();
+            for reference in &snapshot.references {
+                let supported = match reference.kind {
+                    ReferenceKind::Tag => self.client.capabilities.tags,
+                    _ => self.client.capabilities.branches,
+                };
+                if !supported {
+                    continue;
+                }
+                let label = match reference.kind {
+                    ReferenceKind::Tag => format!("tag: {}", reference.name),
+                    ReferenceKind::Branch
+                        if snapshot.branch.as_deref() == Some(&reference.name)
+                            && snapshot.revision.as_deref() == Some(&reference.revision) =>
+                    {
+                        format!("HEAD -> {}", reference.name)
+                    }
+                    _ => reference.name.clone(),
+                };
+                decorations
+                    .entry(self.oid(&reference.revision)?)
+                    .or_default()
+                    .push(label.into());
+            }
+            if let Some(revision) = &snapshot.revision {
+                let labels = decorations.entry(self.oid(revision)?).or_default();
+                if !labels.iter().any(|label| label.starts_with("HEAD -> ")) {
+                    labels.insert(0, "HEAD".into());
+                }
+            }
             let commits = commits
                 .into_iter()
                 .map(|commit| {
                     Arc::new(InitialGraphCommitData {
                         sha: commit.sha,
                         parents: commit.parents,
-                        ref_names: Vec::new(),
+                        ref_names: decorations.remove(&commit.sha).unwrap_or_default(),
                     })
                 })
                 .collect();
@@ -732,12 +838,12 @@ impl GitRepository for ExternalRepository {
         _paths: Vec<RepoPath>,
         _commit_limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileHistoryChangedFileSets>>> {
-        async { bail!("operation unavailable: external VCS provider is read-only") }.boxed()
+        async { bail!("VCS provider does not support related-file history") }.boxed()
     }
     fn commit_data_reader(&self) -> Result<CommitDataReader> {
         ensure_trusted(self)?;
         anyhow::ensure!(
-            self.client.supports_history,
+            self.client.capabilities.history,
             "provider does not support history"
         );
         Ok(CommitDataReader::from_cache(self.history.clone()))
@@ -773,5 +879,114 @@ mod tests {
             assert!(status.has_changes());
             assert_eq!(status.summary().index.modified, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    #[test]
+    fn references_decorate_history_and_select_immutable_branch_tips() {
+        smol::block_on(async {
+            let client = Client::start(
+                "python3",
+                &[
+                    format!(
+                        "{}/../vcs_provider/tests/mock_provider.py",
+                        env!("CARGO_MANIFEST_DIR")
+                    ),
+                    "history-refs".into(),
+                ],
+                &Default::default(),
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+            let repo = ExternalRepository::new(client);
+            assert!(repo.capabilities().contains(
+                RepositoryCapabilities::HISTORY
+                    | RepositoryCapabilities::BRANCHES
+                    | RepositoryCapabilities::TAGS
+                    | RepositoryCapabilities::TRACKING
+            ));
+            assert!(
+                !repo.capabilities().intersects(
+                    RepositoryCapabilities::BLAME | RepositoryCapabilities::BRANCH_DIFF
+                )
+            );
+            let branches = repo.branches().await.unwrap().branches;
+            assert_eq!(branches.len(), 4);
+            let main = branches.iter().find(|branch| branch.is_head).unwrap();
+            assert_eq!(main.ref_name.as_ref(), "refs/heads/main");
+            assert_eq!(
+                main.upstream
+                    .as_ref()
+                    .unwrap()
+                    .tracking
+                    .status()
+                    .unwrap()
+                    .ahead,
+                2
+            );
+            assert!(matches!(
+                branches[1].upstream.as_ref().unwrap().tracking,
+                UpstreamTracking::Unknown
+            ));
+            assert!(matches!(
+                branches[2].upstream.as_ref().unwrap().tracking,
+                UpstreamTracking::Gone
+            ));
+            let (tx, rx) = async_channel::unbounded();
+            repo.initial_graph_data(LogSource::All, LogOrder::DateOrder, tx)
+                .await
+                .unwrap();
+            let commits = rx.recv().await.unwrap();
+            assert_eq!(
+                commits[0].ref_names,
+                vec![SharedString::from("HEAD -> main"), "tag: v1".into()]
+            );
+            assert!(
+                commits[1]
+                    .ref_names
+                    .iter()
+                    .any(|name| name == "origin/main")
+            );
+            assert!(commits[1].ref_names.iter().any(|name| name == "tag: main"));
+            for name in [
+                "refs/heads/topic",
+                "refs/remotes/origin/main",
+                "refs/tags/main",
+            ] {
+                let history = repo
+                    .history_for_source(LogSource::Branch(name.into()))
+                    .await
+                    .unwrap();
+                assert_eq!(history.len(), 1);
+                assert_eq!(history[0].subject.as_ref(), "Initial");
+            }
+            assert!(
+                repo.history_for_source(LogSource::Branch("missing".into()))
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn capability_masks_preserve_legacy_peers_and_ignore_unknown_bits() {
+        assert_eq!(
+            RepositoryCapabilities::from_remote(None, false),
+            RepositoryCapabilities::all()
+        );
+        assert_eq!(
+            RepositoryCapabilities::from_remote(None, true),
+            RepositoryCapabilities::STAGING | RepositoryCapabilities::HISTORY
+        );
+        assert_eq!(
+            RepositoryCapabilities::from_remote(Some(1 << 63), true),
+            RepositoryCapabilities::empty()
+        );
     }
 }

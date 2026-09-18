@@ -43,7 +43,7 @@ fn main() -> Result<()> {
         let start = Instant::now();
         client.refresh().await?;
         println!("Status refreshed in {:?}", start.elapsed());
-        if client.supports_history {
+        if client.capabilities.history {
             let revision = client
                 .snapshot()
                 .revision

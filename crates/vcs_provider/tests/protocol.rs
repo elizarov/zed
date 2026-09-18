@@ -19,7 +19,7 @@ async fn start(mode: &str, timeout: Duration) -> anyhow::Result<Client> {
 fn mock_discovery_status_notifications_and_lazy_content() {
     smol::block_on(async {
         let client = start("normal", Duration::from_secs(3)).await.unwrap();
-        assert!(client.supports_staging);
+        assert!(client.capabilities.staging);
         assert_eq!(client.snapshot().changes.len(), 3);
         let contents = client
             .contents(
@@ -121,7 +121,7 @@ fn expired_snapshot_is_refreshed_and_retried_once() {
 fn optional_history_metadata_and_commit_contents() {
     smol::block_on(async {
         let client = start("history", Duration::from_secs(3)).await.unwrap();
-        assert!(client.supports_history);
+        assert!(client.capabilities.history);
         let history = client.history("revision-2", None, 1).await.unwrap();
         assert_eq!(history.commits.len(), 1);
         assert!(history.has_more);
@@ -147,7 +147,7 @@ fn optional_history_metadata_and_commit_contents() {
         );
         assert!(client.history("revision-2", None, 201).await.is_err());
         let old_provider = start("normal", Duration::from_secs(3)).await.unwrap();
-        assert!(!old_provider.supports_history);
+        assert!(!old_provider.capabilities.history);
         assert!(
             old_provider
                 .history("opaque-revision", None, 1)
@@ -162,5 +162,33 @@ fn optional_history_metadata_and_commit_contents() {
             .await
             .unwrap();
         assert!(client.commit_changes("revision-2").await.is_err());
+    });
+}
+
+#[test]
+fn capabilities_and_reference_validation() {
+    smol::block_on(async {
+        let legacy = start("normal", Duration::from_secs(3)).await.unwrap();
+        assert!(!legacy.capabilities.branches);
+        assert!(!legacy.capabilities.tags);
+        assert!(legacy.snapshot().references.is_empty());
+        let client = start("history-refs", Duration::from_secs(3)).await.unwrap();
+        assert!(
+            client.capabilities.branches
+                && client.capabilities.tags
+                && client.capabilities.tracking
+        );
+        assert_eq!(client.snapshot().references.len(), 6);
+        for mode in [
+            "bad-tracking",
+            "reserved-feature",
+            "bad-refs-duplicate",
+            "bad-refs-name",
+            "bad-refs-counts",
+            "bad-refs-gone",
+            "unadvertised-refs",
+        ] {
+            assert!(start(mode, Duration::from_secs(3)).await.is_err(), "{mode}");
+        }
     });
 }

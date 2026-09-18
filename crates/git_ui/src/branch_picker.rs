@@ -3,7 +3,7 @@ use editor::Editor;
 use fuzzy_nucleo::StringMatchCandidate;
 
 use collections::{HashMap, HashSet};
-use git::repository::{Branch, delete_branch_flag};
+use git::repository::{Branch, LogSource, RepositoryCapabilities, delete_branch_flag};
 use git::{GitHostingProviderRegistry, parse_git_remote_url};
 use gpui::http_client::Url;
 use gpui::{
@@ -77,6 +77,41 @@ pub fn open(
     let workspace_handle = workspace.weak_handle();
     let repository = workspace.project().read(cx).active_repository(cx);
 
+    if repository
+        .as_ref()
+        .is_some_and(|repo| !repo.read(cx).supports(RepositoryCapabilities::BRANCHES))
+    {
+        return;
+    }
+    if let Some(repo) = repository
+        .as_ref()
+        .filter(|repo| repo.read(cx).is_read_only())
+    {
+        let repo_id = repo.read(cx).id;
+        let Some(git_store) = repo.read(cx).git_store() else {
+            return;
+        };
+        let target_workspace = workspace_handle.clone();
+        let on_select = Arc::new(move |branch: Branch, window: &mut Window, cx: &mut App| {
+            target_workspace
+                .update(cx, |workspace, cx| {
+                    crate::git_graph::open_or_reuse_graph(
+                        workspace,
+                        repo_id,
+                        git_store.clone(),
+                        LogSource::Branch(branch.ref_name),
+                        None,
+                        window,
+                        cx,
+                    );
+                })
+                .log_err();
+        });
+        workspace.toggle_modal(window, cx, |window, cx| {
+            select_modal(workspace_handle, repository, None, on_select, window, cx)
+        });
+        return;
+    }
     workspace.toggle_modal(window, cx, |window, cx| {
         BranchList::new(
             workspace_handle,
