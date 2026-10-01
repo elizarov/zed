@@ -1688,6 +1688,7 @@ mod tests {
             is_deleted: false,
             is_binary: false,
             display_name: "abc1234 - notes.md".into(),
+            is_omitted: false,
         }) as Arc<dyn File>;
 
         let buffer = build_buffer(text, blob, &language_registry, &mut async_cx)
