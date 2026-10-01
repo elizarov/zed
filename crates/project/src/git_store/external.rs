@@ -291,8 +291,19 @@ impl GitStore {
             }
         }
         let git_store = cx.weak_entity();
+        let blob_read_limiter = self.blob_read_limiter.clone();
         let repository = cx.new(|cx| {
-            Repository::external(id, root, backend, fs, interval, git_store, updates_tx, cx)
+            Repository::external(
+                id,
+                root,
+                backend,
+                fs,
+                interval,
+                git_store,
+                blob_read_limiter,
+                updates_tx,
+                cx,
+            )
         });
         self._subscriptions
             .push(cx.subscribe(&repository, Self::on_repository_event));
@@ -357,6 +368,7 @@ impl Repository {
         fs: Arc<dyn Fs>,
         interval: Duration,
         git_store: WeakEntity<GitStore>,
+        blob_read_limiter: Arc<Semaphore>,
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -382,6 +394,7 @@ impl Repository {
         let mut repository = Self {
             this: cx.weak_entity(),
             git_store,
+            blob_read_limiter,
             snapshot,
             external_backend: Some(backend.clone()),
             _provider_task: Task::ready(()),
