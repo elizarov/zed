@@ -1653,14 +1653,12 @@ mod tests {
     use gpui::{EmptyView, TestAppContext, VisualTestContext};
     use indoc::indoc;
     use language::{Language, LanguageConfig, markdown_lang};
-    use settings::SettingsStore;
-
     use project::FakeFs;
     use serde_json::json;
+    use settings::SettingsStore;
     use std::path::Path;
     use theme::LoadThemes;
     use workspace::MultiWorkspace;
-
 
     #[gpui::test]
     async fn test_build_buffer_resolves_injected_languages(cx: &mut TestAppContext) {
