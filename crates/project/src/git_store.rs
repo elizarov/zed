@@ -7478,7 +7478,9 @@ impl Repository {
         cx: &App,
     ) -> Task<Result<CommitDiff>> {
         if !self.supports(git::repository::RepositoryCapabilities::HISTORY) {
-            return Task::ready(Err(anyhow!("VCS provider does not support load commit diff")));
+            return Task::ready(Err(anyhow!(
+                "VCS provider does not support load commit diff"
+            )));
         }
         let id = self.id;
         let repository_state = self.repository_state.clone();

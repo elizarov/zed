@@ -255,7 +255,8 @@ impl CommitView {
             let commit_diff = repository.update(cx, |repo, cx| {
                 repo.load_commit_diff(commit_sha.clone(), ignore_shallow_boundary, cx)
             });
-            let commit_details = repository.update(cx, |repo, cx| repo.show_commit(commit_sha.clone(), cx));
+            let commit_details =
+                repository.update(cx, |repo, cx| repo.show_commit(commit_sha.clone(), cx));
             let load = window.spawn(cx, async move |_| {
                 let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
                 anyhow::Ok((

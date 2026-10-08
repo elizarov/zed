@@ -6054,9 +6054,10 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
         .unwrap();
     assert_eq!(details.message.as_ref(), "Change hello\n\nDetails");
     let historical_diff = repository
-        .update(cx, |repo, _| repo.load_commit_diff(revision.clone(), false))
+        .update(cx, |repo, cx| {
+            repo.load_commit_diff(revision.clone(), false, cx)
+        })
         .await
-        .unwrap()
         .unwrap();
     assert_eq!(historical_diff.files.len(), 7);
     assert_eq!(
@@ -6095,9 +6096,8 @@ async fn test_remote_external_provider(cx: &mut TestAppContext, server_cx: &mut 
         .await
         .unwrap();
     let error = repository
-        .update(cx, |repo, _| repo.load_commit_diff(revision, false))
+        .update(cx, |repo, cx| repo.load_commit_diff(revision, false, cx))
         .await
-        .unwrap()
         .unwrap_err();
     assert!(format!("{error:#}").contains("mock content failed"));
     smol::fs::write(&state_path, previous).await.unwrap();

@@ -291,7 +291,7 @@ impl GitStore {
             return None;
         }
         let git_store = cx.weak_entity();
-        let blob_read_limiter = self.blob_read_limiter.clone();
+        let object_read_limiter = self.object_read_limiter.clone();
         let repository = cx.new(|cx| {
             Repository::external(
                 id,
@@ -300,7 +300,7 @@ impl GitStore {
                 fs,
                 interval,
                 git_store,
-                blob_read_limiter,
+                object_read_limiter,
                 updates_tx,
                 cx,
             )
@@ -411,7 +411,7 @@ impl Repository {
         fs: Arc<dyn Fs>,
         interval: Duration,
         git_store: WeakEntity<GitStore>,
-        blob_read_limiter: Arc<Semaphore>,
+        object_read_limiter: Arc<Semaphore>,
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -437,7 +437,7 @@ impl Repository {
         let mut repository = Self {
             this: cx.weak_entity(),
             git_store,
-            blob_read_limiter,
+            object_read_limiter,
             snapshot,
             external_backend: Some(backend.clone()),
             _provider_task: Task::ready(()),
@@ -901,6 +901,23 @@ mod tests {
             repository.add_path_to_gitignore(&git::repository::repo_path("hello.txt"), false)
         });
         assert!(ignore_write.await.unwrap().is_err());
+        assert!(
+            repository
+                .read_with(cx, |repository, cx| repository
+                    .show_commit("revision".into(), cx))
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .read_with(cx, |repository, cx| repository.load_commit_diff(
+                    "revision".into(),
+                    false,
+                    cx
+                ))
+                .await
+                .is_err()
+        );
         assert!(smol::block_on(backend.stage_paths(Vec::new(), Arc::default())).is_err());
         // Native discovery must also win when Git metadata appears after a
         // provider has already registered the workspace.

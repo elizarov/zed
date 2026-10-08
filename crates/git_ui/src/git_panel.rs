@@ -8276,11 +8276,16 @@ impl GitPanel {
         let is_bulk = matches!(target_kind, SelectionTargetKind::Multiple);
         let is_file = matches!(target_kind, SelectionTargetKind::File);
 
+        let has_write_access = self.has_write_access(cx);
         ContextMenu::build(window, cx, |context_menu, _, _| {
             context_menu
                 .context(self.focus_handle.clone())
-                .action(stage_title, ToggleStaged.boxed_clone())
-                .action(restore_title, RestoreFile::default().boxed_clone())
+                .action_disabled_when(!has_write_access, stage_title, ToggleStaged.boxed_clone())
+                .action_disabled_when(
+                    !has_write_access,
+                    restore_title,
+                    RestoreFile::default().boxed_clone(),
+                )
                 .separator()
                 .action("Unstaged Changes", ViewUnstagedChanges.boxed_clone())
                 .action("Staged Changes", ViewStagedChanges.boxed_clone())
@@ -8289,12 +8294,12 @@ impl GitPanel {
                 .action("Copy Relative Path", CopyRelativePath.boxed_clone())
                 .separator()
                 .action_disabled_when(
-                    !all_created || is_bulk,
+                    !has_write_access || !all_created || is_bulk,
                     "Add to .gitignore",
                     AddToGitignore.boxed_clone(),
                 )
                 .action_disabled_when(
-                    !all_created || is_bulk,
+                    !has_write_access || !all_created || is_bulk,
                     "Add to .git/info/exclude",
                     AddToGitInfoExclude.boxed_clone(),
                 )
@@ -10268,6 +10273,17 @@ mod tests {
             .update(&mut cx, |repository, _| repository.barrier())
             .await
             .unwrap();
+        cx.run_until_parked();
+        workspace.read_with(&cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .active_item(cx)
+                    .unwrap()
+                    .downcast::<CommitView>()
+                    .is_some()
+            );
+        });
+        // Immutable commit reads now bypass the serial job queue.
         repository.read_with(&cx, |repository, _| {
             let jobs = repository.job_debug_queue().to_debug_value();
             assert_eq!(jobs["summary"]["pending"], 0);
@@ -10277,8 +10293,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|job| job["description"] == "load_commit_diff"
-                        && job["status"] == "Finished")
+                    .all(|job| job["description"] != "load_commit_diff")
             );
         });
     }
