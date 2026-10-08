@@ -531,7 +531,7 @@ impl Repository {
 async fn has_git_ancestor(fs: &dyn Fs, root: &Path) -> Result<bool> {
     let root = fs.canonicalize(root).await?;
     for ancestor in root.ancestors() {
-        if fs.metadata(&ancestor.join(".git")).await?.is_some() {
+        if fs.is_git_repository(&ancestor.join(".git")).await {
             return Ok(true);
         }
     }
@@ -568,7 +568,7 @@ mod tests {
         fs.insert_tree(
             "/repositories",
             json!({
-                "git": {".git": {}, "src": {"file.txt": "working\n"}},
+                "git": {".git": {"worktrees": {"linked": {}}}, "src": {"file.txt": "working\n"}},
                 "linked": {".git": "gitdir: ../git/.git/worktrees/linked\n"},
                 "plain": {}
             }),

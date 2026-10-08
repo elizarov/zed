@@ -1472,3 +1472,37 @@ async fn restore_can_be_retried_after_collision(cx: &mut TestAppContext) {
         TrashRestoreError::AlreadyRestored
     ));
 }
+
+#[gpui::test]
+async fn test_git_detection_rejects_placeholders(executor: BackgroundExecutor) {
+    let fs = RealFs::new(None, executor);
+    let directory = TempDir::new().unwrap();
+    let root = directory.path();
+    let metadata = root.join(".git");
+    std::fs::create_dir(&metadata).unwrap();
+    assert!(!fs.is_git_repository(&metadata).await);
+    std::fs::write(metadata.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    assert!(!fs.is_git_repository(&metadata).await);
+    std::fs::create_dir(metadata.join("objects")).unwrap();
+    std::fs::create_dir(metadata.join("refs")).unwrap();
+    assert!(fs.is_git_repository(&metadata).await);
+
+    let linked_metadata = metadata.join("worktrees/linked");
+    std::fs::create_dir_all(&linked_metadata).unwrap();
+    std::fs::write(linked_metadata.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+    std::fs::write(linked_metadata.join("commondir"), "../..\n").unwrap();
+    let gitfile = root.join("linked.git");
+    std::fs::write(&gitfile, "gitdir: .git/worktrees/linked\n").unwrap();
+    assert!(fs.is_git_repository(&gitfile).await);
+    std::fs::write(&gitfile, "gitdir: missing\n").unwrap();
+    assert!(!fs.is_git_repository(&gitfile).await);
+    std::fs::write(&gitfile, "not a gitfile\n").unwrap();
+    assert!(!fs.is_git_repository(&gitfile).await);
+
+    #[cfg(unix)]
+    {
+        let alias = root.join("alias.git");
+        std::os::unix::fs::symlink(&metadata, &alias).unwrap();
+        assert!(fs.is_git_repository(&alias).await);
+    }
+}

@@ -177,6 +177,42 @@ pub trait Fs: Send + Sync {
         Arc<dyn Watcher>,
     );
 
+    /// Check repository metadata without invoking Git or scanning working files.
+    /// Supports ordinary repositories, submodules and linked worktrees.
+    async fn is_git_repository(&self, dot_git: &Path) -> bool {
+        let repository_dir = if self.is_file(dot_git).await {
+            let Ok(contents) = self.load(dot_git).await else {
+                return false;
+            };
+            let Some(path) = contents.strip_prefix("gitdir:").map(str::trim) else {
+                return false;
+            };
+            if path.is_empty() {
+                return false;
+            }
+            dot_git.parent().unwrap_or(dot_git).join(path)
+        } else {
+            dot_git.to_path_buf()
+        };
+        if !self.is_file(&repository_dir.join("HEAD")).await {
+            return false;
+        }
+        let common_dir = if self.is_file(&repository_dir.join("commondir")).await {
+            let Ok(contents) = self.load(&repository_dir.join("commondir")).await else {
+                return false;
+            };
+            if contents.trim().is_empty() {
+                return false;
+            }
+            repository_dir.join(contents.trim())
+        } else {
+            repository_dir
+        };
+        self.is_dir(&common_dir.join("objects")).await
+            && (self.is_dir(&common_dir.join("refs")).await
+                || self.is_dir(&common_dir.join("reftable")).await)
+    }
+
     fn open_repo(
         &self,
         abs_dot_git: &Path,
@@ -3397,6 +3433,12 @@ impl Fs for FakeFs {
             .watch_roots
             .push((normalize_path(path), Arc::downgrade(&watcher)));
         (events, watcher)
+    }
+
+    async fn is_git_repository(&self, dot_git: &Path) -> bool {
+        // FakeFs represents repositories with synthetic state, including empty .git fixtures.
+        self.with_git_state_and_paths(dot_git, false, |_, _, _| ())
+            .is_ok()
     }
 
     fn open_repo(

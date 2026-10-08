@@ -7417,3 +7417,55 @@ fn set_file_scan_depth(cx: &mut TestAppContext, depth: Option<u32>) {
         });
     });
 }
+
+#[gpui::test]
+async fn test_empty_git_placeholder_is_not_a_repository(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    init_test(cx);
+    // TempTree initializes .git fixtures, so create the empty placeholder afterward.
+    let directory = TempTree::new(json!({"file.txt": "working\n"}));
+    std::fs::create_dir(directory.path().join(".git")).unwrap();
+    let tree = Worktree::local(
+        directory.path(),
+        true,
+        RealFs::new(None, cx.executor()),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    tree.read_with(cx, |tree, _| {
+        assert!(tree.as_local().unwrap().repositories().is_empty());
+        assert!(tree.snapshot().root_repo_common_dir().is_none());
+    });
+    drop(tree);
+
+    std::fs::write(directory.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::create_dir(directory.path().join(".git/objects")).unwrap();
+    std::fs::create_dir(directory.path().join(".git/refs")).unwrap();
+    let child = directory.path().join("src");
+    std::fs::create_dir_all(child.join(".git")).unwrap();
+    let tree = Worktree::local(
+        child.as_path(),
+        true,
+        RealFs::new(None, cx.executor()),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(1),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.as_local().unwrap().repositories(),
+            vec![Arc::<Path>::from(directory.path())]
+        );
+    });
+}

@@ -37,8 +37,10 @@ paths; shell expansions, including `~`, do not apply. Polling defaults to 2000 m
 
 The setting makes one external provider available per opened worktree on the host,
 including subdirectories of larger repositories. Native Git takes priority: a
-`.git` directory or file at the workspace root or an ancestor prevents provider
-startup. This includes linked worktrees and symlinked workspace paths. Native Git
+`.git` repository at the workspace root or an ancestor prevents provider startup.
+Detection validates repository metadata, following gitfiles and shared worktree
+metadata; an empty `.git` placeholder does not count. This includes linked
+worktrees and symlinked workspace paths. Native Git
 scanning remains enabled, including nested repositories. If Git is discovered for
 the workspace after provider startup, it replaces the external repository.
 

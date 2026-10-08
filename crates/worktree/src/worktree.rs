@@ -3583,7 +3583,10 @@ impl BackgroundScannerState {
         dot_git_abs_path: Arc<Path>,
         fs: &dyn Fs,
         watcher: &dyn Watcher,
-    ) -> Result<LocalRepositoryEntry> {
+    ) -> Result<Option<LocalRepositoryEntry>> {
+        if !fs.is_git_repository(&dot_git_abs_path).await {
+            return Ok(None);
+        }
         let work_dir_entry = self
             .snapshot
             .entry_for_path(&work_directory.path_key().0)
@@ -3648,7 +3651,7 @@ impl BackgroundScannerState {
             .insert(work_directory_id, local_repository.clone());
 
         log::trace!("inserting new local git repository");
-        Ok(local_repository)
+        Ok(Some(local_repository))
     }
 }
 
@@ -4417,7 +4420,7 @@ impl BackgroundScanner {
                         self.watcher.as_ref(),
                     )
                     .await
-                    .log_err()?;
+                    .log_err()??;
                 Some(ancestor_dot_git)
             })
             .await
@@ -6311,13 +6314,8 @@ async fn discover_ancestor_git_repo(
 
         let ancestor_dot_git = ancestor.join(DOT_GIT);
         log::trace!("considering ancestor: {ancestor_dot_git:?}");
-        // Check whether the directory or file called `.git` exists (in the
-        // case of worktrees it's a file.)
-        if fs
-            .metadata(&ancestor_dot_git)
-            .await
-            .is_ok_and(|metadata| metadata.is_some())
-        {
+        // A placeholder must not hide a real repository farther up the tree.
+        if fs.is_git_repository(&ancestor_dot_git).await {
             let dot_git_abs_path = if index != 0 {
                 // We canonicalize, since the FS events use the canonicalized path.
                 match fs.canonicalize(&ancestor_dot_git).await.log_err() {
@@ -7167,7 +7165,7 @@ async fn discover_root_repo_metadata(
     fs: &dyn Fs,
 ) -> Option<(Arc<Path>, bool)> {
     let root_dot_git = root_abs_path.join(DOT_GIT);
-    if !fs.metadata(&root_dot_git).await.is_ok_and(|m| m.is_some()) {
+    if !fs.is_git_repository(&root_dot_git).await {
         return None;
     }
     let dot_git_path: Arc<Path> = root_dot_git.into();
