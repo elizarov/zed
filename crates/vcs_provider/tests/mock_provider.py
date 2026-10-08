@@ -55,8 +55,9 @@ while True:
         if mode == "remote":
             assert os.getcwd() == root
             assert os.environ["VCS_PROVIDER_TEST_HOST"] == "server"
-        result = {"id": "mock", "root": root, "label": "Mock VCS"}
+        result = None if mode == "decline" else {"id": "mock", "root": root, "label": "Mock VCS"}
     elif method == "repository/status":
+        assert mode != "decline", "status requested after discovery declined"
         counter += 1
         if mode == "status-error" and counter > 1:
             send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32000, "message": "offline"}})

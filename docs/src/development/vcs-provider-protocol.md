@@ -35,9 +35,17 @@ and is launched directly, without shell interpretation. Use absolute executable
 paths; shell expansions, including `~`, do not apply. Polling defaults to 2000 ms
 (minimum 250); request timeouts default to 30000 ms (clamped to 100–300000).
 
-The setting selects one external provider per opened worktree on the host, including
-when the worktree is a subdirectory of a larger repository. It supersedes native
-Git discovery in that worktree. After a failed launch, the panel shows the error
+The setting makes one external provider available per opened worktree on the host,
+including subdirectories of larger repositories. Native Git takes priority: a
+`.git` directory or file at the workspace root or an ancestor prevents provider
+startup. This includes linked worktrees and symlinked workspace paths. Native Git
+scanning remains enabled, including nested repositories. If Git is discovered for
+the workspace after provider startup, it replaces the external repository.
+
+Otherwise Zed asks the provider to discover the workspace. Returning `null` means
+not applicable, leaves no repository or error, and permits Git initialization.
+This makes user-wide and server-wide provider settings usable across mixed VCS
+workspaces. A failed launch or discovery error still shows the error
 and a **Retry** button. Retry uses the current provider settings and restarts only
 failed providers, leaving active repositories and pending launches alone. Restart
 the project to change the configuration of an already running provider. Startup
@@ -197,7 +205,10 @@ It returns `null` if unsupported, or:
 readable text. `root` must equal the requested absolute workspace path: the
 provider may internally discover a containing repository, but must scope paths,
 status, and comparisons to the opened directory. Version 0.1 supports one discovery
-and one repository per process. A provider returning `null` is not registered.
+and one repository per process. A provider returning `null` is not registered;
+Zed closes the process without requesting status. Providers should check their
+repository markers before starting expensive work. Backend failures in a
+recognized repository must remain errors, not `null`.
 
 All subsequent methods take `repository: id`. Unknown IDs are invalid parameters.
 All file paths use `/` separators and are relative to `root`. Empty paths, empty
@@ -568,3 +579,5 @@ cargo run -p remote --example vcs_probe -- /work/project src/example.txt \
 
 Set `ZED_VCS_PROBE_HISTORY=list` to also verify history and metadata, or `diff`
 to open the newest commit diff. Use a small workspace for the latter.
+Set `ZED_VCS_PROBE_NATIVE_GIT=1` to verify native Git detection while a provider
+is configured globally; the probe still performs only read operations.

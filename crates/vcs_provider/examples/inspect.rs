@@ -21,7 +21,8 @@ fn main() -> Result<()> {
             Path::new(&root),
             Duration::from_secs(60),
         )
-        .await?;
+        .await?
+        .context("provider did not recognize this workspace")?;
         println!(
             "{}: {} status entries; initialized in {:?}",
             client.repository.label,

@@ -2730,18 +2730,20 @@ impl GitStore {
         fs: Arc<dyn Fs>,
         cx: &mut Context<Self>,
     ) {
-        if ProjectSettings::get(
-            Some(SettingsLocation {
-                worktree_id,
-                path: RelPath::empty(),
-            }),
-            cx,
-        )
-        .vcs_provider
-        .is_some()
+        if let Some(worktree) = self
+            .worktree_store
+            .read(cx)
+            .worktree_for_id(worktree_id, cx)
         {
-            self.start_external_providers(cx);
-            return;
+            let root = worktree.read(cx).abs_path();
+            if updated_git_repositories.iter().any(|update| {
+                update
+                    .new_work_directory_abs_path
+                    .as_ref()
+                    .is_some_and(|directory| root.starts_with(directory))
+            }) {
+                self.prefer_native_repository(worktree_id, cx);
+            }
         }
         let mut removed_ids = Vec::new();
 
@@ -3465,20 +3467,34 @@ impl GitStore {
         fallback_branch_name: String,
         cx: &App,
     ) -> Task<Result<()>> {
-        for worktree in self.worktree_store.read(cx).worktrees() {
-            let worktree = worktree.read(cx);
-            if path.starts_with(worktree.abs_path().as_ref())
-                && ProjectSettings::get(
-                    Some(SettingsLocation {
-                        worktree_id: worktree.id(),
-                        path: RelPath::empty(),
-                    }),
-                    cx,
-                )
-                .vcs_provider
-                .is_some()
-            {
-                return Task::ready(Err(anyhow!("this workspace uses an external VCS provider")));
+        if self.repositories.values().any(|repository| {
+            let repository = repository.read(cx);
+            repository.is_read_only() && path.starts_with(&repository.work_directory_abs_path)
+        }) {
+            return Task::ready(Err(anyhow!("this workspace uses an external VCS provider")));
+        }
+        // Only the host knows which configured provider applies. Remote clients
+        // forward initialization to the host rather than using local settings.
+        if matches!(self.state, GitStoreState::Local { .. }) {
+            for worktree in self.worktree_store.read(cx).worktrees() {
+                let worktree = worktree.read(cx);
+                if path.starts_with(worktree.abs_path().as_ref())
+                    && ProjectSettings::get(
+                        Some(SettingsLocation {
+                            worktree_id: worktree.id(),
+                            path: RelPath::empty(),
+                        }),
+                        cx,
+                    )
+                    .vcs_provider
+                    .is_some()
+                    && (!self.external_starts.contains_key(&worktree.id())
+                        || self.external_discovery.contains_key(&worktree.id()))
+                {
+                    return Task::ready(Err(anyhow!(
+                        "repository discovery must complete before initializing Git"
+                    )));
+                }
             }
         }
         match &self.state {

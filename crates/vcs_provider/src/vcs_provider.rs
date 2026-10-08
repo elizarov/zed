@@ -443,7 +443,7 @@ impl Client {
         environment: &BTreeMap<String, String>,
         root: &Path,
         timeout: Duration,
-    ) -> Result<Self> {
+    ) -> Result<Option<Self>> {
         let mut child = Command::new(command)
             .args(arguments)
             .envs(environment)
@@ -499,7 +499,9 @@ impl Client {
         let repository: Option<RepositoryInfo> = transport
             .request("repository/discover", json!({"workspaceRoot":root}))
             .await?;
-        let repository = repository.context("provider did not recognize this workspace")?;
+        let Some(repository) = repository else {
+            return Ok(None);
+        };
         ensure!(
             Path::new(&repository.root) == root,
             "provider root must equal the requested workspace scope"
@@ -513,12 +515,12 @@ impl Client {
             .await?;
         snapshot.validate()?;
         snapshot.validate_capabilities(capabilities)?;
-        Ok(Self {
+        Ok(Some(Self {
             transport: std::sync::Arc::new(Mutex::new(Connection::Process(transport))),
             repository,
             capabilities: initialized.capabilities,
             snapshot: RwLock::new(snapshot),
-        })
+        }))
     }
 
     #[cfg(feature = "test-support")]

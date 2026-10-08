@@ -112,6 +112,7 @@ fn main() -> Result<()> {
         .context("usage: vcs_probe ROOT FILE COMMAND [ARG ...]")?;
     let path = arguments.next().context("missing relative file path")?;
     let command = arguments.next().context("missing proxy command")?;
+    let native_git = std::env::var_os("ZED_VCS_PROBE_NATIVE_GIT").is_some();
     smol::block_on(async {
         let mut child = Command::new(command)
             .args(arguments)
@@ -155,11 +156,20 @@ fn main() -> Result<()> {
                 .values()
                 .find(|repository| repository.is_last_update)
             {
-                ensure!(repository.is_read_only, "repository must be read-only");
+                ensure!(
+                    repository.is_read_only != native_git,
+                    "unexpected repository backend: read-only={}",
+                    repository.is_read_only
+                );
                 println!(
-                    "Remote repository: {}; {} changed paths; read-only",
+                    "Remote repository: {}; {} changed paths; {}",
                     repository.abs_path,
-                    repository.updated_statuses.len()
+                    repository.updated_statuses.len(),
+                    if native_git {
+                        "native Git"
+                    } else {
+                        "read-only provider"
+                    }
                 );
                 break;
             }
@@ -169,7 +179,7 @@ fn main() -> Result<()> {
             probe.receive().await?;
         }
         ensure!(
-            probe.saw_repository_loading,
+            native_git || probe.saw_repository_loading,
             "missing repository startup notification"
         );
         let buffer = probe
@@ -201,29 +211,31 @@ fn main() -> Result<()> {
                 .keys()
                 .next()
                 .context("missing repository")?;
-            let editor_error = probe
-                .request(proto::OpenCommitMessageBuffer {
-                    project_id,
-                    repository_id,
-                })
-                .await
-                .err()
-                .context("read-only repositories must not create a commit editor")?;
-            ensure!(
-                editor_error.to_string().contains("read-only"),
-                "{editor_error:#}"
-            );
-            let template = probe
-                .request(proto::LoadCommitTemplate {
-                    project_id,
-                    repository_id,
-                })
-                .await?;
-            ensure!(
-                template.template.is_none(),
-                "read-only repository has a commit template"
-            );
-            println!("Read-only commit editor disabled; template request completed");
+            if !native_git {
+                let editor_error = probe
+                    .request(proto::OpenCommitMessageBuffer {
+                        project_id,
+                        repository_id,
+                    })
+                    .await
+                    .err()
+                    .context("read-only repositories must not create a commit editor")?;
+                ensure!(
+                    editor_error.to_string().contains("read-only"),
+                    "{editor_error:#}"
+                );
+                let template = probe
+                    .request(proto::LoadCommitTemplate {
+                        project_id,
+                        repository_id,
+                    })
+                    .await?;
+                ensure!(
+                    template.template.is_none(),
+                    "read-only repository has a commit template"
+                );
+                println!("Read-only commit editor disabled; template request completed");
+            }
             let request_id = probe
                 .send(
                     proto::GetInitialGraphData {
@@ -325,10 +337,12 @@ fn main() -> Result<()> {
                 worktree_ids: vec![worktree.worktree_id],
             })
             .await?;
-        while !probe.repositories.is_empty() {
-            probe.receive().await?;
+        if !native_git {
+            while !probe.repositories.is_empty() {
+                probe.receive().await?;
+            }
+            println!("Trust revocation removed the remote repository");
         }
-        println!("Trust revocation removed the remote repository");
         // Use a dedicated proxy identifier: this shuts down that test session only.
         if let Err(error) = probe.request(proto::ShutdownRemoteServer {}).await {
             // Server shutdown can close the sockets before its Ack is flushed.

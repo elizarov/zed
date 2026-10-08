@@ -176,16 +176,24 @@ impl GitStore {
                 );
                 let interval =
                     Duration::from_millis(configuration.poll_interval_ms.unwrap_or(2000).max(250));
-                let client = vcs_provider::Client::start(
-                    &configuration.command,
-                    &configuration.args,
-                    &configuration.env,
-                    &root,
-                    timeout,
-                )
+                let client = async {
+                    // Worktree scanning is asynchronous. Check ancestors before spawning
+                    // the provider so global configuration cannot claim a Git workspace.
+                    if has_git_ancestor(fs.as_ref(), &root).await? {
+                        return Ok(None);
+                    }
+                    vcs_provider::Client::start(
+                        &configuration.command,
+                        &configuration.args,
+                        &configuration.env,
+                        &root,
+                        timeout,
+                    )
+                    .await
+                }
                 .await;
                 match client {
-                    Ok(client) => {
+                    Ok(Some(client)) => {
                         let repository = this
                             .update(cx, |this, cx| {
                                 if this
@@ -223,6 +231,12 @@ impl GitStore {
                                 .await
                                 .log_err();
                         }
+                        this.update(cx, |this, cx| {
+                            this.set_repository_discovery(worktree_id, None, cx)
+                        })
+                        .log_err();
+                    }
+                    Ok(None) => {
                         this.update(cx, |this, cx| {
                             this.set_repository_discovery(worktree_id, None, cx)
                         })
@@ -268,27 +282,13 @@ impl GitStore {
             .map(|downstream| downstream.updates_tx.clone());
         let id = RepositoryId(next_repository_id.fetch_add(1, atomic::Ordering::Release));
         let root: Arc<Path> = backend.path().into();
-        // Provider selection is explicit for this scope. Replace an already discovered
-        // native repository so two backends cannot compete for the same files.
-        let replaced = self
-            .repositories
-            .iter()
-            .filter_map(|(id, repository)| {
-                (repository.read(cx).work_directory_abs_path == root).then_some(*id)
-            })
-            .collect::<Vec<_>>();
-        for replaced in replaced {
-            if let Some(updates_tx) = &updates_tx {
-                updates_tx
-                    .unbounded_send(DownstreamUpdate::RemoveRepository(replaced))
-                    .log_err();
-            }
-            self.repositories.remove(&replaced);
-            self.worktree_ids.remove(&replaced);
-            self.display_diffs.remove(&replaced);
-            if self.active_repo_id == Some(replaced) {
-                self.active_repo_id = None;
-            }
+        // A native repository may have appeared while provider discovery was running.
+        if self.repositories.values().any(|repository| {
+            let repository = repository.read(cx);
+            repository.external_backend.is_none()
+                && root.starts_with(&repository.work_directory_abs_path)
+        }) {
+            return None;
         }
         let git_store = cx.weak_entity();
         let blob_read_limiter = self.blob_read_limiter.clone();
@@ -320,6 +320,49 @@ impl GitStore {
             cx.emit(GitStoreEvent::ActiveRepositoryChanged(Some(id)));
         }
         Some(repository)
+    }
+
+    pub(super) fn prefer_native_repository(
+        &mut self,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_starts.remove(&worktree_id);
+        self.set_repository_discovery(worktree_id, None, cx);
+        let removed = self
+            .repositories
+            .iter()
+            .filter_map(|(id, repository)| {
+                (repository.read(cx).external_backend.is_some()
+                    && self
+                        .worktree_ids
+                        .get(id)
+                        .is_some_and(|ids| ids.contains(&worktree_id)))
+                .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in removed {
+            if let Some(repository) = self.repositories.remove(&id) {
+                repository.update(cx, |repository, _| repository.stop_external_provider());
+            }
+            self.worktree_ids.remove(&id);
+            self.display_diffs.remove(&id);
+            if let GitStoreState::Local {
+                downstream: Some(downstream),
+                ..
+            } = &self.state
+            {
+                downstream
+                    .updates_tx
+                    .unbounded_send(DownstreamUpdate::RemoveRepository(id))
+                    .log_err();
+            }
+            cx.emit(GitStoreEvent::RepositoryRemoved(id));
+            if self.active_repo_id == Some(id) {
+                self.active_repo_id = None;
+                cx.emit(GitStoreEvent::ActiveRepositoryChanged(None));
+            }
+        }
     }
 
     pub(super) fn update_diff_operations_for_repository(
@@ -485,12 +528,140 @@ impl Repository {
     }
 }
 
+async fn has_git_ancestor(fs: &dyn Fs, root: &Path) -> Result<bool> {
+    let root = fs.canonicalize(root).await?;
+    for ancestor in root.ancestors() {
+        if fs.metadata(&ancestor.join(".git")).await?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{BorrowAppContext as _, TestAppContext};
     use serde_json::json;
     use util::rel_path::rel_path;
+
+    #[gpui::test]
+    async fn native_git_takes_precedence_over_global_provider(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            crate::trusted_worktrees::init(Default::default(), cx);
+            cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+                settings
+                    .set_user_settings(
+                        &json!({
+                            "session": {"trust_all_worktrees": true},
+                            "vcs_provider": {"command": "/missing/provider-must-not-run"}
+                        })
+                        .to_string(),
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/repositories",
+            json!({
+                "git": {".git": {}, "src": {"file.txt": "working\n"}},
+                "linked": {".git": "gitdir: ../git/.git/worktrees/linked\n"},
+                "plain": {}
+            }),
+        )
+        .await;
+        assert!(
+            has_git_ancestor(fs.as_ref(), Path::new("/repositories/git"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            has_git_ancestor(fs.as_ref(), Path::new("/repositories/git/src"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            has_git_ancestor(fs.as_ref(), Path::new("/repositories/linked"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !has_git_ancestor(fs.as_ref(), Path::new("/repositories/plain"))
+                .await
+                .unwrap()
+        );
+        for scope in ["/repositories/git", "/repositories/git/src"] {
+            let project = Project::test(fs.clone(), [Path::new(scope)], cx).await;
+            cx.run_until_parked();
+            project.read_with(cx, |project, cx| {
+                let store = project.git_store().read(cx);
+                assert!(store.repository_discovery_state().is_none());
+                let repository = store.active_repository().unwrap().read(cx);
+                assert!(!repository.is_read_only());
+                assert!(repository.external_backend.is_none());
+                assert_eq!(
+                    repository.work_directory_abs_path.as_ref(),
+                    Path::new("/repositories/git")
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn declined_provider_allows_git_initialization(cx: &mut TestAppContext) {
+        use gpui::BorrowAppContext as _;
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            crate::trusted_worktrees::init(Default::default(), cx);
+            cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+                settings.set_user_settings(&json!({
+                    "session": {"trust_all_worktrees": true},
+                    "vcs_provider": {
+                        "command": "python3",
+                        "args": [Path::new(env!("CARGO_MANIFEST_DIR")).join("../vcs_provider/tests/mock_provider.py"), "decline"]
+                    }
+                }).to_string(), cx).unwrap();
+            });
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(&root, json!({"file.txt": "working\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [root.as_path()], cx).await;
+        let store = project.read_with(cx, |project, _| project.git_store().clone());
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let completed = futures::future::select(
+            store
+                .condition(cx, |store, _| {
+                    store.external_starts.contains_key(&worktree_id)
+                        && store.repository_discovery_state().is_none()
+                })
+                .boxed_local(),
+            cx.executor().timer(Duration::from_secs(5)).boxed(),
+        )
+        .await;
+        assert!(
+            matches!(completed, futures::future::Either::Left(_)),
+            "discovery timed out"
+        );
+        store.read_with(cx, |store, _| assert!(store.repositories.is_empty()));
+        store
+            .read_with(cx, |store, cx| {
+                store.git_init(root.clone().into(), "main".into(), cx)
+            })
+            .await
+            .unwrap();
+        assert!(fs.metadata(&root.join(".git")).await.unwrap().is_some());
+    }
 
     #[gpui::test]
     async fn external_provider_requires_trust_and_restarts(cx: &mut TestAppContext) {
@@ -731,7 +902,18 @@ mod tests {
         });
         assert!(ignore_write.await.unwrap().is_err());
         assert!(smol::block_on(backend.stage_paths(Vec::new(), Arc::default())).is_err());
-        backend.set_trusted(false);
+        // Native discovery must also win when Git metadata appears after a
+        // provider has already registered the workspace.
+        fs.insert_tree(root, json!({".git": {}})).await;
+        cx.run_until_parked();
+        git_store.read_with(cx, |store, cx| {
+            assert_eq!(store.repositories.len(), 1);
+            let native = store.active_repository().unwrap();
+            assert_ne!(native.entity_id(), repository.entity_id());
+            assert!(!native.read(cx).is_read_only());
+            assert!(native.read(cx).external_backend.is_none());
+        });
+        assert!(!repository.read_with(cx, |repository, _| repository.is_trusted()));
         assert!(smol::block_on(backend.refresh()).is_err());
     }
 }

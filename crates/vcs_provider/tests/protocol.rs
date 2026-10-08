@@ -12,7 +12,27 @@ async fn start(mode: &str, timeout: Duration) -> anyhow::Result<Client> {
         Path::new(env!("CARGO_MANIFEST_DIR")),
         timeout,
     )
-    .await
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("mock provider did not recognize the workspace"))
+}
+
+#[test]
+fn unrecognized_workspace_is_not_an_error() {
+    smol::block_on(async {
+        let result = Client::start(
+            "python3",
+            &[
+                format!("{}/tests/mock_provider.py", env!("CARGO_MANIFEST_DIR")),
+                "decline".into(),
+            ],
+            &BTreeMap::new(),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+    });
 }
 
 #[test]

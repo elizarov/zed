@@ -903,6 +903,7 @@ mod reference_tests {
                 std::time::Duration::from_secs(3),
             )
             .await
+            .unwrap()
             .unwrap();
             let repo = ExternalRepository::new(client);
             assert!(repo.capabilities().contains(

@@ -3776,6 +3776,19 @@ async fn test_add_path_to_git_info_exclude_in_remote_linked_worktree(
     fs.set_head_for_repo(repository_dir, &[], "head-sha");
 
     let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    // A server-wide external provider must not replace native Git, including gitfiles.
+    server_cx
+        .update_global::<SettingsStore, _>(|settings, cx| {
+            settings.set_server_settings(
+                &json!({
+                    "session": {"trust_all_worktrees": true},
+                    "vcs_provider": {"command": "/missing/provider-must-not-run"}
+                })
+                .to_string(),
+                cx,
+            )
+        })
+        .unwrap();
     project
         .update(cx, |project, cx| {
             project.find_or_create_worktree(Path::new("/worktree"), true, cx)
@@ -3860,6 +3873,19 @@ async fn test_remote_git_diffs(cx: &mut TestAppContext, server_cx: &mut TestAppC
     );
 
     let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    // A server-wide external provider must not replace native Git, including gitfiles.
+    server_cx
+        .update_global::<SettingsStore, _>(|settings, cx| {
+            settings.set_server_settings(
+                &json!({
+                    "session": {"trust_all_worktrees": true},
+                    "vcs_provider": {"command": "/missing/provider-must-not-run"}
+                })
+                .to_string(),
+                cx,
+            )
+        })
+        .unwrap();
     let (worktree, _) = project
         .update(cx, |project, cx| {
             project.find_or_create_worktree("/code/project1", true, cx)
